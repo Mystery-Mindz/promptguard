@@ -1,1 +1,45 @@
-# Owner: backend owner — see /docs or team roadmap for what goes here
+from datetime import datetime
+from typing import Any, Literal
+
+from pydantic import BaseModel
+
+InputSource = Literal["user", "tool_output", "document", "agent_handoff"]
+InputProvenance = Literal["internal", "external"]
+ProvenanceFlag = Literal["internal", "external", "tainted"]
+Classification = Literal["clean", "suspicious", "malicious"]
+Decision = Literal["block", "approval_required", "allow_logged"]
+
+
+class TraceStep(BaseModel):
+    step_id: int
+    actor: str
+    input_text: str
+    input_source: InputSource
+    input_provenance: InputProvenance
+    action: str
+    action_params: dict[str, Any]
+    timestamp: datetime
+
+
+class Trace(BaseModel):
+    trace_id: str
+    agent_id: str
+    original_goal: str
+    steps: list[TraceStep]
+
+
+class DetectionOutput(BaseModel):
+    trace_id: str
+    step_id: int
+    drift_score: float
+    risk_score: int
+    provenance_flag: ProvenanceFlag
+    classification: Classification
+    explanation: str
+    decision: Decision
+
+
+class RunAgentRequest(BaseModel):
+    original_goal: str
+    trace_id: str = "trace_001"
+    agent_id: str = "agent_A"
