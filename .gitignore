@@ -1,14 +1,6 @@
-# Dependencies
-node_modules/
-
-# Environment variables
+venv/
+__pycache__/
+*.pyc
 .env
-.env.local
-
-# Operating System files
 .DS_Store
-Thumbs.db
-
-# Build outputs
-dist/
-build/
+.streamlit/secrets.toml
