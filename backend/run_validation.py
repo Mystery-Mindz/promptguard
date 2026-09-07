@@ -12,9 +12,15 @@ By default this runs the app in-process via FastAPI's TestClient (no server
 needs to be running). Pass --base-url to hit an already-running server
 instead.
 
+--test-data-dir accepts one or more directories (each scanned with a flat,
+non-recursive glob, so nested subfolders within a given directory are NOT
+picked up automatically). The default scans both ../test-data/traces and
+../test-data/agentdojo_subset.
+
 Usage:
     python run_validation.py
-    python run_validation.py --test-data-dir ../test-data
+    python run_validation.py --test-data-dir ../test-data/traces
+    python run_validation.py --test-data-dir ../test-data/traces ../test-data/agentdojo_subset
     python run_validation.py --base-url http://127.0.0.1:8000
 """
 
@@ -39,15 +45,18 @@ def _get_client(base_url: str | None):
     return TestClient(app)
 
 
-def _load_trace_files(test_data_dir: str) -> list[str]:
-    return sorted(glob.glob(os.path.join(test_data_dir, "*.json")))
+def _load_trace_files(test_data_dirs: list[str]) -> list[str]:
+    trace_files = []
+    for test_data_dir in test_data_dirs:
+        trace_files.extend(glob.glob(os.path.join(test_data_dir, "*.json")))
+    return sorted(trace_files)
 
 
-def run_validation(test_data_dir: str, base_url: str | None) -> int:
-    trace_files = _load_trace_files(test_data_dir)
+def run_validation(test_data_dirs: list[str], base_url: str | None) -> int:
+    trace_files = _load_trace_files(test_data_dirs)
 
     if not trace_files:
-        print(f"No .json trace files found in {test_data_dir}")
+        print(f"No .json trace files found in {test_data_dirs}")
         return 0
 
     client = _get_client(base_url)
@@ -132,10 +141,19 @@ def run_validation(test_data_dir: str, base_url: str | None) -> int:
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
+    _script_dir = os.path.dirname(os.path.abspath(__file__))
     parser.add_argument(
         "--test-data-dir",
-        default=os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "test-data"),
-        help="Directory containing *.json trace files (default: ../test-data relative to this script)",
+        nargs="+",
+        default=[
+            os.path.join(_script_dir, "..", "test-data", "traces"),
+            os.path.join(_script_dir, "..", "test-data", "agentdojo_subset"),
+        ],
+        help=(
+            "One or more directories containing *.json trace files (flat glob, "
+            "not recursive). Default: ../test-data/traces and "
+            "../test-data/agentdojo_subset relative to this script."
+        ),
     )
     parser.add_argument(
         "--base-url",
