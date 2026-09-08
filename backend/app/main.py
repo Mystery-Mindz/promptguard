@@ -1,9 +1,7 @@
 from datetime import datetime, timezone
 
-from fastapi import FastAPI, HTTPException, Request
-from fastapi.exceptions import RequestValidationError
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
 
 from app import storage
 from app.agent import run_agent
@@ -36,23 +34,6 @@ app.add_middleware(
 )
 
 storage.init_db()
-
-
-# TEMPORARY DEBUG LOGGING — remove once the /analyze-trace 422s reported by
-# Person 2's dashboard are diagnosed. Logs the exact raw request body that
-# failed validation (not just "it failed"), so we can see what was actually
-# sent instead of guessing. Only fires for /analyze-trace; every other
-# route still gets FastAPI's normal validation-error response.
-@app.exception_handler(RequestValidationError)
-async def _log_analyze_trace_validation_errors(request: Request, exc: RequestValidationError) -> JSONResponse:
-    if request.url.path == "/analyze-trace":
-        raw_body = await request.body()
-        print("=" * 70)
-        print(f"[422 DEBUG] {request.method} {request.url.path} failed validation")
-        print(f"[422 DEBUG] raw request body:\n{raw_body.decode('utf-8', errors='replace')}")
-        print(f"[422 DEBUG] validation errors: {exc.errors()}")
-        print("=" * 70)
-    return JSONResponse(status_code=422, content={"detail": exc.errors()})
 
 
 @app.post("/run-agent", response_model=Trace)
