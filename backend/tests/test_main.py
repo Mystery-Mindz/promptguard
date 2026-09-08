@@ -44,6 +44,31 @@ def test_approval_decision_succeeds_for_flagged_step():
     assert body["final_status"] == "approved_and_allowed"
 
 
+def test_approval_decision_rejects_second_call_on_already_decided_step():
+    _seed("trace_test", 99, "approval_required")
+
+    first_response = client.post(
+        "/approval-decision",
+        json={"trace_id": "trace_test", "step_id": 99, "operator_decision": "approved", "operator_id": "reviewer_1"},
+    )
+    assert first_response.status_code == 200
+
+    second_response = client.post(
+        "/approval-decision",
+        json={"trace_id": "trace_test", "step_id": 99, "operator_decision": "denied", "operator_id": "reviewer_2"},
+    )
+
+    assert second_response.status_code == 409
+    detail = second_response.json()["detail"]
+    assert "reviewer_1" in detail
+    assert "approved" in detail
+
+    # Confirm the original decision was NOT overwritten by the rejected second call.
+    unchanged = storage.get_approval_decision("trace_test", 99)
+    assert unchanged["operator_decision"] == "approved"
+    assert unchanged["operator_id"] == "reviewer_1"
+
+
 def test_approval_decision_denied_maps_to_denied_and_blocked():
     _seed("trace_test", 2, "approval_required")
 

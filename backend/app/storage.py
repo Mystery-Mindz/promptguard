@@ -111,6 +111,19 @@ def get_detection_decision(trace_id: str, step_id: int) -> str | None:
     return row[0] if row else None
 
 
+def get_approval_decision(trace_id: str, step_id: int) -> dict | None:
+    """Returns the existing recorded decision for (trace_id, step_id), or None if
+    no operator has decided on it yet."""
+    with _connect() as conn:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute(
+            "SELECT operator_decision, operator_id, final_status, timestamp "
+            "FROM approval_decisions WHERE trace_id = ? AND step_id = ?",
+            (trace_id, step_id),
+        ).fetchone()
+    return dict(row) if row else None
+
+
 def save_approval_decision(
     trace_id: str,
     step_id: int,

@@ -134,6 +134,16 @@ def approval_decision_endpoint(request: ApprovalDecisionRequest) -> ApprovalDeci
             f"approval_required (recorded decision: {stored_decision!r}); nothing to approve or deny.",
         )
 
+    existing_decision = storage.get_approval_decision(request.trace_id, request.step_id)
+    if existing_decision is not None:
+        raise HTTPException(
+            status_code=409,
+            detail=f"trace_id={request.trace_id!r}, step_id={request.step_id} was already "
+            f"{existing_decision['operator_decision']!r} by operator_id="
+            f"{existing_decision['operator_id']!r} at {existing_decision['timestamp']}; "
+            "a decision cannot be changed once made.",
+        )
+
     final_status: str = "approved_and_allowed" if request.operator_decision == "approved" else "denied_and_blocked"
     timestamp = datetime.now(timezone.utc)
 
