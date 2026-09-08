@@ -8,6 +8,8 @@ InputProvenance = Literal["internal", "external"]
 ProvenanceFlag = Literal["internal", "external", "tainted"]
 Classification = Literal["clean", "suspicious", "malicious"]
 Decision = Literal["block", "approval_required", "allow_logged"]
+OperatorDecision = Literal["approved", "denied"]
+FinalStatus = Literal["approved_and_allowed", "denied_and_blocked"]
 
 
 class TraceStep(BaseModel):
@@ -43,3 +45,17 @@ class RunAgentRequest(BaseModel):
     original_goal: str
     trace_id: str = "trace_001"
     agent_id: str = "agent_A"
+
+
+class ApprovalDecisionRequest(BaseModel):
+    trace_id: str
+    step_id: int
+    operator_decision: OperatorDecision
+    operator_id: str | None = None
+
+
+class ApprovalDecisionResponse(BaseModel):
+    trace_id: str
+    step_id: int
+    final_status: FinalStatus
+    timestamp: datetime

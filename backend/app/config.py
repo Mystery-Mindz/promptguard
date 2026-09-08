@@ -36,3 +36,6 @@ INJECTION_CONFIDENCE_WEIGHT = 0.4
 
 # Agent loop cap — the only place this should be set.
 AGENT_MAX_STEPS = 6
+
+# SQLite persistence path — the only place this should be set.
+DATABASE_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "promptguard.db")

@@ -1,13 +1,38 @@
-from fastapi import FastAPI
+from datetime import datetime, timezone
 
+from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+
+from app import storage
 from app.agent import run_agent
 from app.config import RISK_APPROVAL_HIGH_THRESHOLD, RISK_APPROVAL_LOW_THRESHOLD, RISK_BLOCK_THRESHOLD
 from app.drift_engine import compute_drift_and_risk
 from app.gate import decide
 from app.provenance import get_provenance_flag
-from app.schemas import Classification, DetectionOutput, ProvenanceFlag, RunAgentRequest, Trace, TraceStep
+from app.schemas import (
+    ApprovalDecisionRequest,
+    ApprovalDecisionResponse,
+    Classification,
+    DetectionOutput,
+    ProvenanceFlag,
+    RunAgentRequest,
+    Trace,
+    TraceStep,
+)
 
 app = FastAPI(title="PromptGuard")
+
+# Allow the frontend (Streamlit, typically on 8501/8502) to call this API
+# from any localhost port — the two run as separate processes/ports.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origin_regex=r"^https?://(localhost|127\.0\.0\.1):\d+$",
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+storage.init_db()
 
 
 @app.post("/run-agent", response_model=Trace)
@@ -41,17 +66,54 @@ def analyze_trace(trace: Trace) -> list[DetectionOutput]:
         provenance_flag = get_provenance_flag(trace, step.step_id)
         decision = decide(risk_score, provenance_flag)
 
-        outputs.append(
-            DetectionOutput(
-                trace_id=trace.trace_id,
-                step_id=step.step_id,
-                drift_score=drift_score,
-                risk_score=risk_score,
-                provenance_flag=provenance_flag,
-                classification=_classification_for(risk_score),
-                explanation=_explanation_for(step, drift_score, risk_score, provenance_flag),
-                decision=decision,
-            )
+        output = DetectionOutput(
+            trace_id=trace.trace_id,
+            step_id=step.step_id,
+            drift_score=drift_score,
+            risk_score=risk_score,
+            provenance_flag=provenance_flag,
+            classification=_classification_for(risk_score),
+            explanation=_explanation_for(step, drift_score, risk_score, provenance_flag),
+            decision=decision,
         )
+        storage.save_detection_output(output)
+        outputs.append(output)
 
     return outputs
+
+
+@app.post("/approval-decision", response_model=ApprovalDecisionResponse)
+def approval_decision_endpoint(request: ApprovalDecisionRequest) -> ApprovalDecisionResponse:
+    stored_decision = storage.get_detection_decision(request.trace_id, request.step_id)
+
+    if stored_decision is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No detection found for trace_id={request.trace_id!r}, step_id={request.step_id}. "
+            "Run /analyze-trace on this trace first.",
+        )
+    if stored_decision != "approval_required":
+        raise HTTPException(
+            status_code=409,
+            detail=f"trace_id={request.trace_id!r}, step_id={request.step_id} was not flagged "
+            f"approval_required (recorded decision: {stored_decision!r}); nothing to approve or deny.",
+        )
+
+    final_status: str = "approved_and_allowed" if request.operator_decision == "approved" else "denied_and_blocked"
+    timestamp = datetime.now(timezone.utc)
+
+    storage.save_approval_decision(
+        trace_id=request.trace_id,
+        step_id=request.step_id,
+        operator_decision=request.operator_decision,
+        operator_id=request.operator_id,
+        final_status=final_status,
+        timestamp=timestamp.isoformat(),
+    )
+
+    return ApprovalDecisionResponse(
+        trace_id=request.trace_id,
+        step_id=request.step_id,
+        final_status=final_status,
+        timestamp=timestamp,
+    )
