@@ -131,7 +131,8 @@ Rejections (standard FastAPI error shape, `{"detail": "..."}`), confirmed live:
 ## API
 
 - `POST /analyze-trace` — accepts a trace (see schema above), returns a list of detection outputs, one per step. Persists each output to SQLite as it computes it.
-- `POST /approval-decision` — accepts a human operator's approve/deny decision for a specific `(trace_id, step_id)` that was flagged `approval_required` by a prior `/analyze-trace` call (see schema above). Rejects (404/409) if that step was never analyzed or wasn't flagged `approval_required`.
+- `GET /pending-approvals` — returns every detection currently flagged `approval_required` that has no recorded `operator_decision` yet (i.e. genuinely still pending — anything already approved or denied is excluded). Response is a list of `{trace_id, step_id, risk_score, provenance_flag, explanation, timestamp}` objects (`timestamp` is when `/analyze-trace` recorded that detection, not part of the trace/detection schema above). Lets the frontend poll for real work instead of using hardcoded test data.
+- `POST /approval-decision` — accepts a human operator's approve/deny decision for a specific `(trace_id, step_id)` that was flagged `approval_required` by a prior `/analyze-trace` call (see schema above). Rejects (404/409) if that step was never analyzed or wasn't flagged `approval_required`. **Known gap**: it does NOT reject a second decision on an already-decided `(trace_id, step_id)` — confirmed live, a second call silently overwrites the first (`INSERT OR REPLACE`, no check against `approval_decisions`). Fix before a live demo if double-decision protection matters.
 - `POST /run-agent` — runs the mock agent loop for a given `original_goal` and returns the resulting `Trace`.
 - CORS is enabled for any `http://localhost:<port>` or `http://127.0.0.1:<port>` origin, so the Streamlit frontend can call this API from a different port.
 

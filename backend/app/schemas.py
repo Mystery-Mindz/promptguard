@@ -59,3 +59,12 @@ class ApprovalDecisionResponse(BaseModel):
     step_id: int
     final_status: FinalStatus
     timestamp: datetime
+
+
+class PendingApproval(BaseModel):
+    trace_id: str
+    step_id: int
+    risk_score: int
+    provenance_flag: ProvenanceFlag
+    explanation: str
+    timestamp: datetime

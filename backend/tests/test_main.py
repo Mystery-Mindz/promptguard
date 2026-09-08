@@ -74,3 +74,34 @@ def test_approval_decision_rejects_step_not_flagged_approval_required():
     )
 
     assert response.status_code == 409
+
+
+def test_pending_approvals_returns_correct_records_and_excludes_decided_ones():
+    _seed("trace_pending", 1, "approval_required")  # genuinely pending — should be returned
+    _seed("trace_pending", 2, "allow_logged")  # wrong decision — should be excluded
+    _seed("trace_decided", 1, "approval_required")  # already decided — should be excluded
+
+    storage.save_approval_decision(
+        trace_id="trace_decided",
+        step_id=1,
+        operator_decision="approved",
+        operator_id="reviewer_1",
+        final_status="approved_and_allowed",
+        timestamp="2026-01-01T00:00:00+00:00",
+    )
+
+    response = client.get("/pending-approvals")
+
+    assert response.status_code == 200
+    body = response.json()
+    pairs = {(item["trace_id"], item["step_id"]) for item in body}
+
+    assert ("trace_pending", 1) in pairs
+    assert ("trace_pending", 2) not in pairs
+    assert ("trace_decided", 1) not in pairs
+
+    pending_entry = next(item for item in body if item["trace_id"] == "trace_pending")
+    assert pending_entry["risk_score"] == 60
+    assert pending_entry["provenance_flag"] == "external"
+    assert pending_entry["explanation"] == "test fixture"
+    assert "timestamp" in pending_entry
