@@ -1,9 +1,12 @@
+from datetime import datetime, timezone
+from unittest.mock import patch
+
 import pytest
 from fastapi.testclient import TestClient
 
 from app import config, storage
 from app.main import app
-from app.schemas import DetectionOutput
+from app.schemas import DetectionOutput, Trace, TraceStep
 
 client = TestClient(app)
 
@@ -130,3 +133,103 @@ def test_pending_approvals_returns_correct_records_and_excludes_decided_ones():
     assert pending_entry["provenance_flag"] == "external"
     assert pending_entry["explanation"] == "test fixture"
     assert "timestamp" in pending_entry
+
+
+# --- Endpoint-level tests for /analyze-trace and /run-agent ---
+#
+# These go through the real FastAPI routes via TestClient (real request/
+# response validation, real routing), not the underlying functions directly.
+# compute_drift_and_risk / run_agent are mocked at the app.main import site
+# to keep these fast, deterministic, and offline — they make real Gemini
+# calls otherwise (paced at 13s/call and rate-limited on the free tier),
+# which is what test_drift_engine.py's unit tests already cover separately.
+
+
+def test_analyze_trace_endpoint_returns_correct_schema_for_valid_trace():
+    valid_trace = {
+        "trace_id": "trace_endpoint_test",
+        "agent_id": "agent_A",
+        "original_goal": "Read and summarize today's emails",
+        "steps": [
+            {
+                "step_id": 1,
+                "actor": "agent_A",
+                "input_text": "Please read my inbox and summarize anything urgent.",
+                "input_source": "user",
+                "input_provenance": "internal",
+                "action": "read_email",
+                "action_params": {"folder": "inbox"},
+                "timestamp": "2026-09-08T10:00:00Z",
+            }
+        ],
+    }
+
+    with patch("app.main.compute_drift_and_risk", return_value=(0.2, 25)):
+        response = client.post("/analyze-trace", json=valid_trace)
+
+    assert response.status_code == 200
+    body = response.json()
+    assert isinstance(body, list)
+    assert len(body) == 1
+
+    output = body[0]
+    assert set(output.keys()) == {
+        "trace_id",
+        "step_id",
+        "drift_score",
+        "risk_score",
+        "provenance_flag",
+        "classification",
+        "explanation",
+        "decision",
+    }
+    assert output["trace_id"] == "trace_endpoint_test"
+    assert output["step_id"] == 1
+    assert output["drift_score"] == 0.2
+    assert output["risk_score"] == 25
+    assert output["provenance_flag"] == "internal"
+    assert output["classification"] == "clean"
+    assert output["decision"] == "allow_logged"
+
+
+def test_analyze_trace_endpoint_returns_422_for_malformed_trace():
+    malformed_trace = {"trace_id": "bad_trace"}  # missing agent_id, original_goal, steps
+
+    response = client.post("/analyze-trace", json=malformed_trace)
+
+    assert response.status_code == 422
+    assert "detail" in response.json()
+
+
+def test_run_agent_endpoint_runs_end_to_end_without_error():
+    fake_trace = Trace(
+        trace_id="trace_run_test",
+        agent_id="agent_A",
+        original_goal="Read my inbox and summarize anything urgent",
+        steps=[
+            TraceStep(
+                step_id=1,
+                actor="agent_A",
+                input_text="Read my inbox and summarize anything urgent",
+                input_source="user",
+                input_provenance="internal",
+                action="read_email",
+                action_params={"folder": "inbox"},
+                timestamp=datetime.now(timezone.utc),
+            )
+        ],
+    )
+
+    with patch("app.main.run_agent", return_value=fake_trace) as mock_run_agent:
+        response = client.post(
+            "/run-agent",
+            json={"original_goal": "Read my inbox and summarize anything urgent"},
+        )
+
+    assert response.status_code == 200
+    mock_run_agent.assert_called_once()
+    body = response.json()
+    assert body["trace_id"] == "trace_run_test"
+    assert body["agent_id"] == "agent_A"
+    assert len(body["steps"]) == 1
+    assert body["steps"][0]["action"] == "read_email"
