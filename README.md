@@ -13,10 +13,11 @@ PromptGuard targets two specific blind spots in current agent security:
 
 ## Architecture
 
-A FastAPI backend exposes three endpoints:
+A FastAPI backend exposes four endpoints:
 - `POST /run-agent` — drives a mock tool-calling agent (Gemini function calling) against a stated goal, producing a step-by-step trace of everything it did.
 - `POST /analyze-trace` — runs any trace (agent-generated or hand-built) through the detection pipeline and returns a per-step risk assessment.
-- `POST /approval-decision` — records a human reviewer's approve/deny call on a step the pipeline flagged for review. Persisted to SQLite and validated against the original flagged record, so a decision can't be spoofed by tampering with the flagged content itself.
+- `GET /pending-approvals` — returns every detection currently flagged for review that hasn't been approved or denied yet, so the approval dashboard can poll for real work instead of using hardcoded data.
+- `POST /approval-decision` — records a human reviewer's approve/deny call on a step the pipeline flagged for review. Persisted to SQLite and validated against the original flagged record, so a decision can't be spoofed by tampering with the flagged content itself, and rejected if that step was already decided.
 
 Each step in a trace passes through three independently-testable components, wired together by `main.py`:
 - **Intent Drift Engine** — embeds the step's content and compares it against the original goal, and separately asks a judge model whether the text driving that step looks like an injected instruction. The two signals combine into a 0–100 risk score.
@@ -25,7 +26,7 @@ Each step in a trace passes through three independently-testable components, wir
 
 ![Architecture](docs/architecture_diagram.png)
 
-A Streamlit frontend (separate codebase, in `frontend/`) is planned to call this API for running/visualizing traces and driving the human-approval workflow — see the note under "How to Run" on its current status.
+A Streamlit frontend (separate codebase, in `frontend/`) calls this API: an **Agent Activity Dashboard** (`app.py`, port 8501) visualizes a trace step-by-step alongside its detection results, and an **Operator Approval Console** (`approval_dashboard.py`, port 8502) polls `/pending-approvals` and lets an authenticated reviewer approve or deny flagged steps via `/approval-decision`. Both are live and working.
 
 ## Tech Stack
 
@@ -51,7 +52,7 @@ pip install -r requirements.txt
 streamlit run app.py
 streamlit run approval_dashboard.py --server.port 8502
 ```
-> As of this writing, `frontend/app.py` and `frontend/approval_dashboard.py` are still placeholder stubs — the commands above are how to run them once built, not a working app today.
+`app.py` runs on Streamlit's default port (8501); `approval_dashboard.py` is explicitly pinned to 8502 so both can run side by side.
 
 ## Team
 
