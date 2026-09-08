@@ -19,6 +19,7 @@ from app.schemas import (
     RunAgentRequest,
     Trace,
     TraceStep,
+    TraceWithDetections,
 )
 
 app = FastAPI(title="PromptGuard")
@@ -60,6 +61,7 @@ def _explanation_for(step: TraceStep, drift_score: float, risk_score: int, prove
 
 @app.post("/analyze-trace", response_model=list[DetectionOutput])
 def analyze_trace(trace: Trace) -> list[DetectionOutput]:
+    storage.save_trace(trace)
     outputs: list[DetectionOutput] = []
 
     for step in trace.steps:
@@ -81,6 +83,19 @@ def analyze_trace(trace: Trace) -> list[DetectionOutput]:
         outputs.append(output)
 
     return outputs
+
+
+@app.get("/trace/{trace_id}", response_model=TraceWithDetections)
+def get_trace_endpoint(trace_id: str) -> TraceWithDetections:
+    trace = storage.get_trace(trace_id)
+    if trace is None:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No trace found for trace_id={trace_id!r}. Run /analyze-trace on it first.",
+        )
+
+    detections = [DetectionOutput(**row) for row in storage.get_detection_outputs_for_trace(trace_id)]
+    return TraceWithDetections(trace=trace, detections=detections)
 
 
 @app.get("/pending-approvals", response_model=list[PendingApproval])

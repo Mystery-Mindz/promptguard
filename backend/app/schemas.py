@@ -68,3 +68,8 @@ class PendingApproval(BaseModel):
     provenance_flag: ProvenanceFlag
     explanation: str
     timestamp: datetime
+
+
+class TraceWithDetections(BaseModel):
+    trace: Trace
+    detections: list[DetectionOutput]

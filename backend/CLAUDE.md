@@ -130,7 +130,8 @@ Rejections (standard FastAPI error shape, `{"detail": "..."}`), confirmed live:
 
 ## API
 
-- `POST /analyze-trace` — accepts a trace (see schema above), returns a list of detection outputs, one per step. Persists each output to SQLite as it computes it.
+- `POST /analyze-trace` — accepts a trace (see schema above), returns a list of detection outputs, one per step. Persists the trace itself (`traces`/`trace_steps` tables) as well as each detection output to SQLite as it computes it.
+- `GET /trace/{trace_id}` — returns `{"trace": Trace, "detections": [DetectionOutput, ...]}` for a trace previously analyzed via `/analyze-trace`. 404 if that `trace_id` was never analyzed. Lets a client (e.g. the dashboard) look up one specific real trace by ID instead of resending a fixed payload.
 - `GET /pending-approvals` — returns every detection currently flagged `approval_required` that has no recorded `operator_decision` yet (i.e. genuinely still pending — anything already approved or denied is excluded). Response is a list of `{trace_id, step_id, risk_score, provenance_flag, explanation, timestamp}` objects (`timestamp` is when `/analyze-trace` recorded that detection, not part of the trace/detection schema above). Lets the frontend poll for real work instead of using hardcoded test data.
 - `POST /approval-decision` — accepts a human operator's approve/deny decision for a specific `(trace_id, step_id)` that was flagged `approval_required` by a prior `/analyze-trace` call (see schema above). Rejects with 404 if that step was never analyzed, 409 if it wasn't flagged `approval_required`, and 409 if it was already decided (states who decided it, what they decided, and when — fixed 2026-09-08; previously a second call silently overwrote the first).
 - `POST /run-agent` — runs the mock agent loop for a given `original_goal` and returns the resulting `Trace`.
