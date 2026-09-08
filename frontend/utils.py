@@ -15,6 +15,20 @@ def analyze_trace(trace):
 
     return response.json()
 
+def get_trace(trace_id):
+    """Fetches a previously-analyzed trace and its detections by ID.
+    Returns None if trace_id was never analyzed (404), so the caller can show
+    a friendly message instead of an exception.
+    """
+    response = requests.get(
+        f"{BACKEND_URL}/trace/{trace_id}",
+        timeout=30,
+    )
+    if response.status_code == 404:
+        return None
+    response.raise_for_status()
+    return response.json()
+
 def get_pending_approvals():
     response = requests.get(
         f"{BACKEND_URL}/pending-approvals",

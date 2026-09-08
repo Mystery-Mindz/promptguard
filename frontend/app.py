@@ -1,6 +1,6 @@
 
 import streamlit as st
-from utils import analyze_trace
+from utils import analyze_trace, get_trace
 
 # ---------------------------------------------------------
 # Page configuration
@@ -58,10 +58,10 @@ trace = {
 
 demo_mode = st.sidebar.checkbox("Demo Mode", value=True)
 # ---------------------------------------------------------
-# Hardcoded detection result
+# Hardcoded detection result (demo mode only)
 # ---------------------------------------------------------
 
-detection = {
+demo_detection = {
     "trace_id": "trace_001",
     "step_id": 2,
     "drift_score": 0.83,
@@ -74,12 +74,28 @@ detection = {
     ),
     "decision": "block",
 }
+
 if demo_mode:
     st.sidebar.info("Using demo detection data")
+    detections_by_step = {demo_detection["step_id"]: demo_detection}
 else:
     st.sidebar.success("Using live backend detection")
-    detection_results = analyze_trace(trace)
-    detection = detection_results[-1]
+    trace_id_input = st.sidebar.text_input("Trace ID", value="trace_live_demo_02")
+
+    if not trace_id_input:
+        st.info("Enter a trace_id in the sidebar to load its real results.")
+        st.stop()
+
+    result = get_trace(trace_id_input)
+    if result is None:
+        st.warning(
+            f"No stored trace found for trace_id={trace_id_input!r}. "
+            "Run the agent and /analyze-trace on it first, or check the ID."
+        )
+        st.stop()
+
+    trace = result["trace"]
+    detections_by_step = {d["step_id"]: d for d in result["detections"]}
 
 
 # ---------------------------------------------------------
@@ -115,10 +131,14 @@ with header_col1:
         "and identify risky behavior."
     )
 
+headline_detection = max(
+    detections_by_step.values(), key=lambda d: d["risk_score"], default=None
+)
+
 with header_col2:
     st.metric(
         "Current Risk",
-        f"{detection['risk_score']}/100"
+        f"{headline_detection['risk_score']}/100" if headline_detection else "N/A"
     )
 
 st.divider()
@@ -154,16 +174,24 @@ st.info(f"**Original Goal:** {trace['original_goal']}")
 st.markdown("## Agent Activity Timeline")
 
 for step in trace["steps"]:
-    is_flagged = step["step_id"] == detection["step_id"]
+    step_detection = detections_by_step.get(step["step_id"])
+    is_flagged = step_detection is not None
 
     if is_flagged:
-        risk_score = detection["risk_score"]
+        risk_score = step_detection["risk_score"]
         risk_label = get_risk_label(risk_score)
+        decision = step_detection["decision"]
 
-        st.error(
-            f"🔴 **STEP {step['step_id']} — {step['action']}**  "
+        banner = (
+            f"STEP {step['step_id']} — {step['action']}**  "
             f"| **{risk_label} RISK — {risk_score}/100**"
         )
+        if decision == "block":
+            st.error(f"🔴 **{banner}")
+        elif decision == "approval_required":
+            st.warning(f"🟠 **{banner}")
+        else:
+            st.success(f"🟢 **{banner}")
     else:
         st.success(
             f"🟢 **STEP {step['step_id']} — {step['action']}**  "
@@ -196,47 +224,47 @@ for step in trace["steps"]:
         with col1:
             st.metric(
                 "Risk Score",
-                f"{detection['risk_score']}/100"
+                f"{step_detection['risk_score']}/100"
             )
 
         with col2:
             st.metric(
                 "Drift Score",
-                detection["drift_score"]
+                step_detection["drift_score"]
             )
 
         with col3:
             st.metric(
                 "Classification",
-                detection["classification"]
+                step_detection["classification"]
             )
 
         with col4:
             st.metric(
                 "Decision",
-                detection["decision"].upper()
+                step_detection["decision"].upper()
             )
 
         st.warning(
             f"**Why was this flagged?** "
-            f"{detection['explanation']}"
+            f"{step_detection['explanation']}"
         )
 
-        if detection["decision"] == "block":
+        if step_detection["decision"] == "block":
             st.error(
                 "🛑 **ACTION BLOCKED** — PromptGuard prevented this "
                 "agent action from executing."
             )
 
 
-        elif detection["decision"] == "approval_required":
+        elif step_detection["decision"] == "approval_required":
             st.warning(
                 "⚠️ **OPERATOR APPROVAL REQUIRED** — "
                 "This action requires review in the separate "
                 "Operator Approval Console."
             )
 
-        elif detection["decision"] == "allow_logged":
+        elif step_detection["decision"] == "allow_logged":
             st.success(
                 "✅ **ACTION ALLOWED** — "
                 "PromptGuard allowed this action and logged it."
@@ -244,7 +272,7 @@ for step in trace["steps"]:
 
         st.write(
             f"**Provenance Flag:** "
-            f"`{detection['provenance_flag']}`"
+            f"`{step_detection['provenance_flag']}`"
         )
 
     st.divider()
