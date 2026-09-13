@@ -20,4 +20,10 @@ EXPOSE 8000
 # runtime via python-dotenv/os.getenv — never baked into the image. Pass it
 # with `docker run --env-file` or `-e` (see README/CLAUDE.md for the exact
 # command).
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+#
+# Shell form (not exec form) deliberately, so ${PORT:-8000} actually
+# expands — exec-form CMD arrays don't go through a shell and would pass
+# the literal string "${PORT:-8000}" to uvicorn. Needed for platforms
+# (Render, Cloud Run, etc.) that assign a dynamic port via $PORT; falls
+# back to 8000 for local `docker run` with no PORT set.
+CMD uvicorn app.main:app --host 0.0.0.0 --port ${PORT:-8000}
