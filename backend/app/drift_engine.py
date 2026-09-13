@@ -11,6 +11,7 @@ from app.config import (
     GEMINI_API_KEY,
     INJECTION_CONFIDENCE_WEIGHT,
     JUDGE_MODEL,
+    MIN_SECONDS_BETWEEN_GEMINI_CALLS,
 )
 from app.schemas import Trace, TraceStep
 
@@ -20,17 +21,16 @@ from app.schemas import Trace, TraceStep
 # this as the fallback for whatever pacing doesn't prevent — one doesn't
 # replace the other. Keyed by model name since embeddings and judge calls
 # hit independent quota buckets and shouldn't throttle each other.
-_MIN_SECONDS_BETWEEN_CALLS = 13.0
 _last_call_at: dict[str, float] = {}
 
 
 def _pace_calls(model: str) -> None:
     """Sleeps as needed to keep successive calls to `model` at least
-    _MIN_SECONDS_BETWEEN_CALLS apart, staying under the free-tier quota."""
+    MIN_SECONDS_BETWEEN_GEMINI_CALLS apart, staying under the free-tier quota."""
     last = _last_call_at.get(model, 0.0)
     elapsed = time.monotonic() - last
-    if elapsed < _MIN_SECONDS_BETWEEN_CALLS:
-        time.sleep(_MIN_SECONDS_BETWEEN_CALLS - elapsed)
+    if elapsed < MIN_SECONDS_BETWEEN_GEMINI_CALLS:
+        time.sleep(MIN_SECONDS_BETWEEN_GEMINI_CALLS - elapsed)
     _last_call_at[model] = time.monotonic()
 
 INJECTION_CLASSIFIER_PROMPT = (

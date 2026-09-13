@@ -39,3 +39,13 @@ AGENT_MAX_STEPS = 6
 
 # SQLite persistence path — the only place this should be set.
 DATABASE_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "promptguard.db")
+
+# Gemini call pacing/timeouts — the only place these should be set. Shared by
+# agent.py (agent loop) and drift_engine.py (embedding + judge calls) so a
+# quota-driven change only needs to happen in one place.
+MIN_SECONDS_BETWEEN_GEMINI_CALLS = 13.0
+GEMINI_CLIENT_TIMEOUT_MS = 30_000
+
+# Default trace_id for /run-agent requests that don't supply their own —
+# the only place this default should be set.
+DEFAULT_TRACE_ID = "trace_001"

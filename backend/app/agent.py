@@ -5,7 +5,7 @@ from typing import Any
 from google import genai
 from google.genai import types
 
-from app.config import AGENT_MAX_STEPS, AGENT_MODEL, GEMINI_API_KEY
+from app.config import AGENT_MAX_STEPS, AGENT_MODEL, GEMINI_API_KEY, GEMINI_CLIENT_TIMEOUT_MS, MIN_SECONDS_BETWEEN_GEMINI_CALLS
 from app.schemas import InputProvenance, InputSource, Trace, TraceStep
 from app.tools import delete_file, read_email, send_message
 
@@ -14,7 +14,6 @@ from app.tools import delete_file, read_email, send_message
 # SDK's own internal retry-with-backoff *and* still leave the caller to
 # retry again — compounding into multi-minute stalls. Enforcing a floor on
 # the gap between calls keeps normal runs under quota in the first place.
-_MIN_SECONDS_BETWEEN_CALLS = 13.0
 _last_call_at: float = 0.0
 
 SYSTEM_PROMPT = (
@@ -79,7 +78,7 @@ def _get_client() -> genai.Client:
     if _client is None:
         # Explicit timeout so a stalled connection can't hang a call
         # indefinitely — bounds worst-case latency per request.
-        _client = genai.Client(api_key=GEMINI_API_KEY, http_options=types.HttpOptions(timeout=30_000))
+        _client = genai.Client(api_key=GEMINI_API_KEY, http_options=types.HttpOptions(timeout=GEMINI_CLIENT_TIMEOUT_MS))
     return _client
 
 
@@ -89,11 +88,11 @@ def _now() -> str:
 
 def _pace_calls() -> None:
     """Sleeps as needed to keep generate_content calls at least
-    _MIN_SECONDS_BETWEEN_CALLS apart, staying under the free-tier quota."""
+    MIN_SECONDS_BETWEEN_GEMINI_CALLS apart, staying under the free-tier quota."""
     global _last_call_at
     elapsed = time.monotonic() - _last_call_at
-    if elapsed < _MIN_SECONDS_BETWEEN_CALLS:
-        time.sleep(_MIN_SECONDS_BETWEEN_CALLS - elapsed)
+    if elapsed < MIN_SECONDS_BETWEEN_GEMINI_CALLS:
+        time.sleep(MIN_SECONDS_BETWEEN_GEMINI_CALLS - elapsed)
     _last_call_at = time.monotonic()
 
 
