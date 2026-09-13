@@ -1,0 +1,33 @@
+# Operator Approval Console (approval_dashboard.py) — one of two
+# independent Streamlit processes in this directory; see
+# Dockerfile.dashboard for the other (Agent Activity Dashboard). Kept as
+# separate images/Dockerfiles rather than one image with a build-arg
+# switch, since these already run as two independent processes on two
+# ports with different security postures (this one gates on an operator
+# token).
+#
+# Matches the Python version pinned for the backend (3.14.x — see
+# ../backend/Dockerfile and ../backend/requirements.txt).
+FROM python:3.14.5-slim
+
+WORKDIR /app
+
+# Install dependencies first, separately from app code, so this layer is
+# only invalidated when requirements.txt actually changes.
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copy the rest of the frontend (shared config.py/utils.py plus both
+# scripts — this image only runs approval_dashboard.py, but the shared
+# modules need to be present since it imports them). See .dockerignore.
+COPY . .
+
+EXPOSE 8502
+
+# BACKEND_URL, APPROVAL_TOKEN, etc. are read from the environment at
+# runtime (see frontend/config.py) — never baked into the image. Pass them
+# with `docker run --env-file` or `-e`.
+#
+# --server.headless=true skips Streamlit's interactive first-run prompt,
+# which would otherwise hang a container with no attached terminal.
+CMD ["streamlit", "run", "approval_dashboard.py", "--server.address=0.0.0.0", "--server.port=8502", "--server.headless=true"]

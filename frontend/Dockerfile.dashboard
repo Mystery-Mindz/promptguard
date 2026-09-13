@@ -1,0 +1,31 @@
+# Agent Activity Dashboard (app.py) — one of two independent Streamlit
+# processes in this directory; see Dockerfile.approval for the other
+# (Operator Approval Console). Kept as separate images/Dockerfiles rather
+# than one image with a build-arg switch, since these already run as two
+# independent processes on two ports with different security postures.
+#
+# Matches the Python version pinned for the backend (3.14.x — see
+# ../backend/Dockerfile and ../backend/requirements.txt).
+FROM python:3.14.5-slim
+
+WORKDIR /app
+
+# Install dependencies first, separately from app code, so this layer is
+# only invalidated when requirements.txt actually changes.
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copy the rest of the frontend (shared config.py/utils.py plus both
+# scripts — this image only runs app.py, but the shared modules need to be
+# present since app.py imports them). See .dockerignore for exclusions.
+COPY . .
+
+EXPOSE 8501
+
+# BACKEND_URL, APPROVAL_TOKEN, etc. are read from the environment at
+# runtime (see frontend/config.py) — never baked into the image. Pass them
+# with `docker run --env-file` or `-e`.
+#
+# --server.headless=true skips Streamlit's interactive first-run prompt,
+# which would otherwise hang a container with no attached terminal.
+CMD ["streamlit", "run", "app.py", "--server.address=0.0.0.0", "--server.port=8501", "--server.headless=true"]
