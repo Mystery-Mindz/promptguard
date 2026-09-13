@@ -1,0 +1,54 @@
+name: Backend CI
+
+"on":
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    name: Lint, type-check, and test
+    runs-on: ubuntu-latest
+
+    defaults:
+      run:
+        working-directory: backend
+
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          # Matches the Python version used in local development (3.14.x).
+          python-version: "3.14"
+          cache: "pip"
+          cache-dependency-path: |
+            backend/requirements.txt
+            backend/requirements-dev.txt
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt -r requirements-dev.txt
+
+      - name: Lint with ruff
+        run: ruff check app/
+
+      - name: Type-check with mypy
+        run: mypy app/
+
+      - name: Run tests
+        env:
+          # No test in this suite makes a real Gemini API call — every code
+          # path that touches google-genai (agent.run_agent,
+          # drift_engine.compute_drift_and_risk) is mocked at its Gemini
+          # client boundary (see backend/tests/test_drift_engine.py and
+          # test_main.py). This placeholder key is a safety net only: if a
+          # future test regresses and accidentally constructs a real
+          # client, it fails fast on a bad key instead of making a live
+          # network call (and incurring cost) in CI.
+          GEMINI_API_KEY: "ci-placeholder-not-a-real-key"
+        run: pytest tests/ -v
