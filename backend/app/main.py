@@ -1,3 +1,4 @@
+import os
 from datetime import UTC, datetime
 
 from fastapi import FastAPI, HTTPException
@@ -36,6 +37,18 @@ app.add_middleware(
 )
 
 storage.init_db()
+
+
+@app.get("/health")
+def health_endpoint() -> dict[str, str]:
+    """API endpoint: `GET /health`. A basic liveness check for deployment
+    platforms (load balancers, container orchestrators) to confirm the
+    process is up and serving requests. Deliberately shallow — no database
+    or Gemini connectivity check, just confirms the app itself is alive.
+
+    Takes no parameters. Returns `{"status": "ok"}` with HTTP 200.
+    """
+    return {"status": "ok"}
 
 
 @app.post("/run-agent", response_model=Trace)
@@ -246,3 +259,15 @@ def approval_decision_endpoint(request: ApprovalDecisionRequest) -> ApprovalDeci
         final_status=final_status,
         timestamp=timestamp,
     )
+
+
+if __name__ == "__main__":
+    # Lets a deployment platform (Render, Railway, Cloud Run, etc.) run this
+    # directly (`python -m app.main`) and have it bind to whatever port the
+    # platform assigns via the PORT env var, instead of a hardcoded one.
+    # Local dev and the Dockerfile can still invoke uvicorn's own CLI
+    # directly if preferred — this block only runs when main.py is executed
+    # as a script, not when uvicorn imports `app.main:app` as a module.
+    import uvicorn
+
+    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", "8000")))

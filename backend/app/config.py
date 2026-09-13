@@ -47,8 +47,13 @@ INJECTION_CONFIDENCE_WEIGHT = 0.4
 # Agent loop cap — the only place this should be set.
 AGENT_MAX_STEPS = 6
 
-# SQLite persistence path — the only place this should be set.
-DATABASE_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "promptguard.db")
+# SQLite persistence path — the only place this should be set. Overridable
+# via the DATABASE_PATH env var (e.g. to point at a mounted persistent
+# volume in a deployment container); defaults to a file next to the repo
+# for local dev.
+DATABASE_PATH = os.getenv(
+    "DATABASE_PATH", os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "promptguard.db")
+)
 
 # Gemini call pacing/timeouts — the only place these should be set. Shared by
 # agent.py (agent loop) and drift_engine.py (embedding + judge calls) so a
