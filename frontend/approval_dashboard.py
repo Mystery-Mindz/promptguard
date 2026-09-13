@@ -1,4 +1,5 @@
 import streamlit as st
+from config import APPROVAL_TOKEN
 from utils import submit_approval, get_pending_approvals
 
 
@@ -22,11 +23,10 @@ st.set_page_config(
 
 
 # ---------------------------------------------------------
-# Demo authentication
+# Demo authentication — a single shared token (see config.py), not real
+# per-operator auth. Intentional for the hackathon demo, not an accidental
+# leftover; swap for real auth before this ever guards non-demo data.
 # ---------------------------------------------------------
-
-APPROVAL_TOKEN = "promptguard-demo"
-
 
 st.title("🔐 PromptGuard")
 st.caption("Operator Approval Console")

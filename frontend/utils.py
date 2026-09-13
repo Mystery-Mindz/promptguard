@@ -1,14 +1,13 @@
 import requests
 
+from config import ANALYZE_TRACE_TIMEOUT_SECONDS, BACKEND_URL, DEFAULT_TIMEOUT_SECONDS
 
-BACKEND_URL = "http://172.16.129.37:8000"
-    
 
 def analyze_trace(trace):
     response = requests.post(
         f"{BACKEND_URL}/analyze-trace",
         json=trace,
-        timeout=90,
+        timeout=ANALYZE_TRACE_TIMEOUT_SECONDS,
     )
 
     response.raise_for_status()
@@ -22,7 +21,7 @@ def get_trace(trace_id):
     """
     response = requests.get(
         f"{BACKEND_URL}/trace/{trace_id}",
-        timeout=30,
+        timeout=DEFAULT_TIMEOUT_SECONDS,
     )
     if response.status_code == 404:
         return None
@@ -32,7 +31,7 @@ def get_trace(trace_id):
 def get_pending_approvals():
     response = requests.get(
         f"{BACKEND_URL}/pending-approvals",
-        timeout=30,
+        timeout=DEFAULT_TIMEOUT_SECONDS,
     )
     response.raise_for_status()
     return response.json()
@@ -46,7 +45,7 @@ def submit_approval(trace_id, step_id, operator_decision, operator_id):
             "operator_decision": operator_decision,
             "operator_id": operator_id,
         },
-        timeout=30,
+        timeout=DEFAULT_TIMEOUT_SECONDS,
     )
     response.raise_for_status()
     return response.json()
