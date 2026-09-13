@@ -14,7 +14,10 @@ st.set_page_config(
 
 
 # ---------------------------------------------------------
-# Hardcoded demo trace
+# Demo Mode fallback data — intentional, not a leftover. Demo Mode needs a
+# working example that renders without hitting the backend at all (e.g. no
+# server running, or presenting offline); this trace + demo_detection below
+# are that fixed example, not test scaffolding left behind by accident.
 # ---------------------------------------------------------
 
 trace = {
@@ -58,7 +61,9 @@ trace = {
 
 demo_mode = st.sidebar.checkbox("Demo Mode", value=True)
 # ---------------------------------------------------------
-# Hardcoded detection result (demo mode only)
+# Matching fixed detection result for the Demo Mode trace above — same
+# rationale: an intentional static example, only ever used when Demo Mode
+# is checked.
 # ---------------------------------------------------------
 
 demo_detection = {
@@ -80,7 +85,11 @@ if demo_mode:
     detections_by_step = {demo_detection["step_id"]: demo_detection}
 else:
     st.sidebar.success("Using live backend detection")
-    trace_id_input = st.sidebar.text_input("Trace ID", value="trace_live_demo_02")
+    # No default value here on purpose: any hardcoded trace_id would be tied
+    # to whatever happens to exist in today's database, not a real default.
+    trace_id_input = st.sidebar.text_input(
+        "Trace ID", placeholder="e.g. trace_01 or trace_live_demo_02"
+    )
 
     if not trace_id_input:
         st.info("Enter a trace_id in the sidebar to load its real results.")
