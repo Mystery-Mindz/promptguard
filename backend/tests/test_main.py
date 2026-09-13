@@ -1,5 +1,5 @@
 from datetime import datetime, timezone
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 from fastapi.testclient import TestClient
@@ -233,3 +233,55 @@ def test_run_agent_endpoint_runs_end_to_end_without_error():
     assert body["agent_id"] == "agent_A"
     assert len(body["steps"]) == 1
     assert body["steps"][0]["action"] == "read_email"
+
+
+def test_run_agent_handles_hallucinated_tool_call_without_crashing():
+    """Forces agent.run_agent's real internal loop to run (unlike the test
+    above, which mocks run_agent itself) so we can exercise its
+    TOOL_FUNCTIONS.get(name) handling directly: Gemini is mocked to request
+    a tool name ("list_files") that was never declared in
+    TOOL_DECLARATIONS. Before the fix, this crashed with an unhandled
+    KeyError -> 500. This confirms it now degrades gracefully instead:
+    no crash, a real trace step recorded, a normal 200 response.
+    """
+    hallucinated_call = MagicMock(name="list_files", args={}, id="call_1")
+    hallucinated_call.name = "list_files"
+
+    first_response = MagicMock()
+    first_response.function_calls = [hallucinated_call]
+    first_response.candidates = [MagicMock()]
+
+    second_response = MagicMock()
+    second_response.function_calls = None
+
+    mock_client = MagicMock()
+    mock_client.models.generate_content.side_effect = [first_response, second_response]
+
+    with (
+        patch("app.agent._get_client", return_value=mock_client),
+        patch("app.agent._pace_calls"),
+    ):
+        response = client.post(
+            "/run-agent",
+            json={
+                "original_goal": "Do something no declared tool can do",
+                "trace_id": "trace_hallucination_test",
+            },
+        )
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["trace_id"] == "trace_hallucination_test"
+    assert len(body["steps"]) == 1
+
+    step = body["steps"][0]
+    assert step["action"] == "list_files"
+    assert step["action_params"]["hallucinated_tool_call"] is True
+    assert step["input_source"] == "agent_handoff"
+    assert step["input_provenance"] == "internal"
+
+    # The model must have been told the call failed, so it could try to
+    # recover, instead of the request just crashing.
+    second_call_contents = mock_client.models.generate_content.call_args_list[1].kwargs["contents"]
+    function_response_part = second_call_contents[-1].parts[0]
+    assert function_response_part.function_response.response == {"error": "tool 'list_files' is not available"}

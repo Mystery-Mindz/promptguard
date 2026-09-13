@@ -183,7 +183,53 @@ def run_agent(original_goal: str, trace_id: str, agent_id: str = "agent_A") -> T
             assert call.name, "a function call from Gemini had no tool name"
             name = call.name
             args: dict[str, Any] = dict(call.args or {})
-            result = TOOL_FUNCTIONS[name](**args)
+
+            tool_fn = TOOL_FUNCTIONS.get(name)
+            if tool_fn is None:
+                # Gemini asked to call a tool that was never declared in
+                # TOOL_DECLARATIONS — a hallucinated tool call, not a real
+                # bug in the trace content itself. Record it as its own step
+                # (so it's visible in the trace instead of silently dropped)
+                # and tell the model it's invalid via a normal
+                # function_response, so it can recover on its own instead of
+                # this crashing the whole /run-agent request with an
+                # unhandled KeyError.
+                steps.append(
+                    TraceStep(
+                        step_id=len(steps) + 1,
+                        actor=agent_id,
+                        input_text=f"Model requested an undeclared tool call: '{name}' with args {args}",
+                        # Not "user" or "tool_output" — this wasn't driven by
+                        # the user's goal or by real tool content, it's the
+                        # agent's own invalid decision. "agent_handoff" is
+                        # the closest fit among the fixed InputSource values;
+                        # adding a dedicated value would change the shared
+                        # trace schema (see CLAUDE.md — flag before doing
+                        # that, don't just add one here).
+                        input_source="agent_handoff",
+                        input_provenance="internal",
+                        action=name,
+                        action_params={"hallucinated_tool_call": True, "requested_args": args},
+                        timestamp=_now(),
+                    )
+                )
+                contents.append(
+                    types.Content(
+                        role="user",
+                        parts=[
+                            types.Part(
+                                function_response=types.FunctionResponse(
+                                    id=call.id,
+                                    name=name,
+                                    response={"error": f"tool '{name}' is not available"},
+                                )
+                            )
+                        ],
+                    )
+                )
+                continue
+
+            result = tool_fn(**args)
 
             steps.append(
                 TraceStep(
