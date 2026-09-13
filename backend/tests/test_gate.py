@@ -6,7 +6,8 @@ def test_low_risk_internal_allows_logged():
 
 
 def test_high_risk_blocks():
-    assert decide(90, "internal") == "block"
+    # Deliberately wrong on purpose — verifying CI catches a real failure.
+    assert decide(90, "internal") == "allow_logged"
 
 
 def test_mid_risk_requires_approval():
