@@ -1,7 +1,7 @@
 import json
 import sqlite3
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from app import config
 from app.schemas import DetectionOutput, Trace, TraceStep
@@ -59,7 +59,7 @@ def init_db() -> None:
             conn.execute("ALTER TABLE detection_outputs ADD COLUMN created_at TEXT")
         conn.execute(
             "UPDATE detection_outputs SET created_at = ? WHERE created_at IS NULL",
-            (datetime.now(timezone.utc).isoformat(),),
+            (datetime.now(UTC).isoformat(),),
         )
 
         conn.execute(
@@ -240,7 +240,7 @@ def save_detection_output(output: DetectionOutput) -> None:
                 output.classification,
                 output.explanation,
                 output.decision,
-                datetime.now(timezone.utc).isoformat(),
+                datetime.now(UTC).isoformat(),
             ),
         )
 

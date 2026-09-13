@@ -1,11 +1,18 @@
 import time
-from datetime import datetime, timezone
-from typing import Any, Callable
+from collections.abc import Callable
+from datetime import UTC, datetime
+from typing import Any
 
 from google import genai
 from google.genai import types
 
-from app.config import AGENT_MAX_STEPS, AGENT_MODEL, GEMINI_API_KEY, GEMINI_CLIENT_TIMEOUT_MS, MIN_SECONDS_BETWEEN_GEMINI_CALLS
+from app.config import (
+    AGENT_MAX_STEPS,
+    AGENT_MODEL,
+    GEMINI_API_KEY,
+    GEMINI_CLIENT_TIMEOUT_MS,
+    MIN_SECONDS_BETWEEN_GEMINI_CALLS,
+)
 from app.schemas import InputProvenance, InputSource, Trace, TraceStep
 from app.tools import delete_file, read_email, send_message
 
@@ -26,36 +33,36 @@ TOOL_DECLARATIONS = [
     types.FunctionDeclaration(
         name="read_email",
         description="Read emails from a folder in the user's inbox.",
-        parameters={
-            "type": "object",
-            "properties": {
-                "folder": {"type": "string", "description": "The folder to read, e.g. 'inbox'."},
+        parameters=types.Schema(
+            type=types.Type.OBJECT,
+            properties={
+                "folder": types.Schema(type=types.Type.STRING, description="The folder to read, e.g. 'inbox'."),
             },
-            "required": ["folder"],
-        },
+            required=["folder"],
+        ),
     ),
     types.FunctionDeclaration(
         name="delete_file",
         description="Delete a file at the given path.",
-        parameters={
-            "type": "object",
-            "properties": {
-                "path": {"type": "string", "description": "The path of the file to delete."},
+        parameters=types.Schema(
+            type=types.Type.OBJECT,
+            properties={
+                "path": types.Schema(type=types.Type.STRING, description="The path of the file to delete."),
             },
-            "required": ["path"],
-        },
+            required=["path"],
+        ),
     ),
     types.FunctionDeclaration(
         name="send_message",
         description="Send a message to a recipient.",
-        parameters={
-            "type": "object",
-            "properties": {
-                "to": {"type": "string", "description": "The recipient."},
-                "content": {"type": "string", "description": "The message content."},
+        parameters=types.Schema(
+            type=types.Type.OBJECT,
+            properties={
+                "to": types.Schema(type=types.Type.STRING, description="The recipient."),
+                "content": types.Schema(type=types.Type.STRING, description="The message content."),
             },
-            "required": ["to", "content"],
-        },
+            required=["to", "content"],
+        ),
     ),
 ]
 
@@ -96,7 +103,7 @@ def _now() -> datetime:
     `TraceStep.timestamp` expects — Pydantic serializes it to an ISO-8601
     string (e.g. "2026-09-13T23:04:00+00:00") automatically when the trace
     is returned as JSON."""
-    return datetime.now(timezone.utc)
+    return datetime.now(UTC)
 
 
 def _pace_calls() -> None:

@@ -1,4 +1,4 @@
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -229,7 +229,7 @@ def approval_decision_endpoint(request: ApprovalDecisionRequest) -> ApprovalDeci
         )
 
     final_status: FinalStatus = "approved_and_allowed" if request.operator_decision == "approved" else "denied_and_blocked"
-    timestamp = datetime.now(timezone.utc)
+    timestamp = datetime.now(UTC)
 
     storage.save_approval_decision(
         trace_id=request.trace_id,
