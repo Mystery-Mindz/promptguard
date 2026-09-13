@@ -9,6 +9,13 @@ from app.schemas import DetectionOutput, Trace, TraceStep
 
 @contextmanager
 def _connect():
+    """Opens a connection to the SQLite database at `config.DATABASE_PATH`
+    for use in a `with` block, committing any changes automatically when
+    the block exits normally, and always closing the connection afterward.
+
+    Takes no parameters. Yields a `sqlite3.Connection` for the caller to
+    run queries on.
+    """
     conn = sqlite3.connect(config.DATABASE_PATH)
     try:
         yield conn
@@ -18,6 +25,15 @@ def _connect():
 
 
 def init_db() -> None:
+    """Creates every table PromptGuard needs (`detection_outputs`,
+    `approval_decisions`, `traces`, `trace_steps`) if they don't already
+    exist, and runs a small one-time migration to backfill the
+    `created_at` column on `detection_outputs` for databases created before
+    that column existed. Safe to call every time the app starts — existing
+    tables and data are left alone.
+
+    Takes no parameters and returns nothing.
+    """
     with _connect() as conn:
         conn.execute(
             """
@@ -88,10 +104,19 @@ def init_db() -> None:
 
 
 def save_trace(trace: Trace) -> None:
-    """Persists the trace itself (agent_id, original_goal, and every step's full
-    data) — separate from detection_outputs, which only stores the computed
-    risk assessment. Needed so /trace/{trace_id} can return the original
-    trace content, not just what drift_engine/gate concluded about it."""
+    """Saves (or overwrites) a full trace — its `agent_id`, `original_goal`,
+    and every step's complete data — into the `traces` and `trace_steps`
+    tables. This is separate from `save_detection_output`, which only
+    stores the computed risk assessment; this function preserves the
+    original trace content itself, which is what `GET /trace/{trace_id}`
+    (via `get_trace`) reads back.
+
+    Parameters:
+    - `trace`: the trace to save.
+
+    Returns nothing. If a trace with the same `trace_id` already exists,
+    it (and its steps) are replaced with this version.
+    """
     with _connect() as conn:
         conn.execute(
             "INSERT OR REPLACE INTO traces (trace_id, agent_id, original_goal) VALUES (?, ?, ?)",
@@ -119,8 +144,17 @@ def save_trace(trace: Trace) -> None:
 
 
 def get_trace(trace_id: str) -> Trace | None:
-    """Returns the stored Trace for trace_id (reconstructed from traces +
-    trace_steps), or None if this trace_id was never analyzed."""
+    """Looks up a previously-saved trace by ID and rebuilds it from the
+    database into a `Trace` object.
+
+    Parameters:
+    - `trace_id`: the trace to look up.
+
+    Returns the reconstructed `Trace` (with all of its steps, in step_id
+    order), or `None` if no trace with this ID was ever saved via
+    `save_trace` (e.g. it was only ever run through the old code path that
+    predates trace persistence, or the ID is simply wrong).
+    """
     with _connect() as conn:
         conn.row_factory = sqlite3.Row
         trace_row = conn.execute(
@@ -157,7 +191,16 @@ def get_trace(trace_id: str) -> Trace | None:
 
 
 def get_detection_outputs_for_trace(trace_id: str) -> list[dict]:
-    """Returns every detection_outputs row for trace_id, ordered by step_id."""
+    """Looks up every stored risk-detection result for a given trace.
+
+    Parameters:
+    - `trace_id`: the trace whose detection results to fetch.
+
+    Returns a list of dicts (one per analyzed step, ordered by `step_id`),
+    each shaped like a `DetectionOutput` — used by `GET /trace/{trace_id}`
+    alongside `get_trace` to show both the original trace and what
+    PromptGuard concluded about each step.
+    """
     with _connect() as conn:
         conn.row_factory = sqlite3.Row
         rows = conn.execute(
@@ -169,6 +212,18 @@ def get_detection_outputs_for_trace(trace_id: str) -> list[dict]:
 
 
 def save_detection_output(output: DetectionOutput) -> None:
+    """Saves (or overwrites) one step's computed risk-detection result —
+    drift score, risk score, provenance flag, classification, explanation,
+    and decision — into the `detection_outputs` table, stamped with the
+    current time.
+
+    Parameters:
+    - `output`: the detection result to save (as produced by
+      `main.analyze_trace` from `drift_engine`, `provenance`, and `gate`).
+
+    Returns nothing. If a result already exists for this
+    `(trace_id, step_id)`, it is replaced.
+    """
     with _connect() as conn:
         conn.execute(
             """
@@ -191,8 +246,16 @@ def save_detection_output(output: DetectionOutput) -> None:
 
 
 def get_pending_approvals() -> list[dict]:
-    """Returns every detection currently flagged approval_required that has no
-    recorded operator_decision yet — i.e. genuinely still pending."""
+    """Finds every step that's currently waiting on a human operator's
+    approve/deny decision, for the Operator Approval Console to display.
+
+    Takes no parameters. Returns a list of dicts (one per pending step,
+    oldest first), each with `trace_id`, `step_id`, `risk_score`,
+    `provenance_flag`, `explanation`, and `created_at` — every step whose
+    stored `decision` is `"approval_required"` and that has no matching row
+    in `approval_decisions` yet (i.e. genuinely still undecided; anything
+    already approved or denied is excluded).
+    """
     with _connect() as conn:
         conn.row_factory = sqlite3.Row
         rows = conn.execute(
@@ -210,7 +273,17 @@ def get_pending_approvals() -> list[dict]:
 
 
 def get_detection_decision(trace_id: str, step_id: int) -> str | None:
-    """Returns the stored `decision` for (trace_id, step_id), or None if no detection was ever recorded for it."""
+    """Looks up what PromptGuard's own detection pipeline decided for one
+    step (before any human review), used by `POST /approval-decision` to
+    check that a step was actually flagged before accepting a decision on
+    it.
+
+    Parameters:
+    - `trace_id`, `step_id`: identify the step to look up.
+
+    Returns the stored `decision` string (`"block"`, `"approval_required"`,
+    or `"allow_logged"`), or `None` if this step was never analyzed at all.
+    """
     with _connect() as conn:
         row = conn.execute(
             "SELECT decision FROM detection_outputs WHERE trace_id = ? AND step_id = ?",
@@ -220,8 +293,16 @@ def get_detection_decision(trace_id: str, step_id: int) -> str | None:
 
 
 def get_approval_decision(trace_id: str, step_id: int) -> dict | None:
-    """Returns the existing recorded decision for (trace_id, step_id), or None if
-    no operator has decided on it yet."""
+    """Looks up whether a human operator has already made a decision on a
+    step, used by `POST /approval-decision` to prevent a second, conflicting
+    decision from silently overwriting the first.
+
+    Parameters:
+    - `trace_id`, `step_id`: identify the step to look up.
+
+    Returns a dict with `operator_decision`, `operator_id`, `final_status`,
+    and `timestamp`, or `None` if no operator has decided on this step yet.
+    """
     with _connect() as conn:
         conn.row_factory = sqlite3.Row
         row = conn.execute(
@@ -240,6 +321,22 @@ def save_approval_decision(
     final_status: str,
     timestamp: str,
 ) -> None:
+    """Records a human operator's approve/deny decision for one step, into
+    the `approval_decisions` table.
+
+    Parameters:
+    - `trace_id`, `step_id`: identify the step being decided on.
+    - `operator_decision`: `"approved"` or `"denied"`.
+    - `operator_id`: who made the decision (optional — may be `None`).
+    - `final_status`: the resulting outcome, e.g. `"approved_and_allowed"`
+      or `"denied_and_blocked"`.
+    - `timestamp`: when the decision was made (ISO-8601 string).
+
+    Returns nothing. If a decision already exists for this
+    `(trace_id, step_id)`, it is replaced — callers are expected to check
+    `get_approval_decision` first if a decision should be immutable (as
+    `POST /approval-decision` does).
+    """
     with _connect() as conn:
         conn.execute(
             """

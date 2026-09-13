@@ -4,7 +4,17 @@ from app.schemas import ProvenanceFlag, Trace
 
 
 def _build_graph(trace: Trace) -> nx.DiGraph:
-    """Builds a directed graph of the trace's steps, in order, one node per step_id."""
+    """Builds a simple chain graph representing the order steps happened in,
+    so later code can ask "what happened before this step?".
+
+    Parameters:
+    - `trace`: the trace to build a graph from.
+
+    Returns a NetworkX directed graph (`nx.DiGraph`) with one node per
+    `step_id` (each node also stores that step's `actor` and
+    `input_provenance`), and one edge from each step to the very next step
+    in the trace.
+    """
     graph = nx.DiGraph()
 
     previous_step_id = None
@@ -18,14 +28,26 @@ def _build_graph(trace: Trace) -> nx.DiGraph:
 
 
 def get_provenance_flag(trace: Trace, step_id: int) -> ProvenanceFlag:
-    """Returns "internal", "external", or "tainted" for the given step of the trace.
+    """The main entry point of the Cross-Agent Provenance Tracer: decides
+    whether a given step's input should be trusted, distrusted, or treated
+    as secretly distrusted despite looking trustworthy.
 
-    A step's own declared input_provenance is trusted as-is, unless it's the
-    receiving end of an agent-to-agent handoff (its actor differs from a
-    predecessor's) and some upstream step in the trace ever carried external
-    content — in that case it's "tainted" even though it claims internal.
-    This is the cross-agent poisoning case: a compromised agent can't launder
-    external content into a trusted-looking handoff to another agent.
+    Parameters:
+    - `trace`: the full trace the step belongs to.
+    - `step_id`: which step to check.
+
+    Returns one of three flags:
+    - `"external"` — the step's own `input_provenance` is already marked
+      external (e.g. it came from an email or other untrusted source).
+    - `"tainted"` — the step's `input_provenance` claims "internal", but
+      it's the receiving end of an agent-to-agent handoff (its `actor`
+      differs from the step(s) before it), and some earlier step upstream
+      in the trace ever carried external content. This is the cross-agent
+      poisoning case: a compromised agent can't launder external content
+      into a handoff that looks trustworthy to another agent — the
+      receiving step gets flagged anyway.
+    - `"internal"` — genuinely trusted: declared internal, and either not a
+      handoff or no external content anywhere upstream.
     """
     graph = _build_graph(trace)
     steps_by_id = {step.step_id: step for step in trace.steps}

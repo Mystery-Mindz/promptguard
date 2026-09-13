@@ -1,3 +1,13 @@
+"""Agent Activity Dashboard (Streamlit, runs on port 8501 by default).
+
+Shows a trace step-by-step alongside PromptGuard's detection results for
+each step. Has two modes, chosen via the "Demo Mode" sidebar checkbox:
+- Demo Mode (default): renders a fixed example trace/detection, entirely
+  offline — no backend call at all.
+- Live mode: takes a trace_id typed into the sidebar, fetches that real,
+  previously-analyzed trace from the backend (GET /trace/{trace_id}), and
+  renders its actual stored results.
+"""
 
 import streamlit as st
 from utils import analyze_trace, get_trace
@@ -112,6 +122,16 @@ else:
 # ---------------------------------------------------------
 
 def get_risk_label(risk_score):
+    """Converts a numeric risk score into a display label for the UI.
+
+    Parameters:
+    - `risk_score`: a 0-100 risk score.
+
+    Returns "LOW" (below 40), "MEDIUM" (40-80), or "HIGH" (above 80) — these
+    are display-only bands and are separate from (though currently aligned
+    with) the backend's own block/approval_required/allow_logged thresholds
+    in config.py.
+    """
     if risk_score < 40:
         return "LOW"
     elif risk_score <= 80:

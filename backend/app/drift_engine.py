@@ -25,8 +25,17 @@ _last_call_at: dict[str, float] = {}
 
 
 def _pace_calls(model: str) -> None:
-    """Sleeps as needed to keep successive calls to `model` at least
-    MIN_SECONDS_BETWEEN_GEMINI_CALLS apart, staying under the free-tier quota."""
+    """Pauses execution (if needed) so that consecutive calls to the given
+    Gemini `model` are always at least `MIN_SECONDS_BETWEEN_GEMINI_CALLS`
+    seconds apart. Each model is paced independently (tracked by name in
+    `_last_call_at`), since the embedding model and the judge model have
+    separate quota buckets and shouldn't throttle each other.
+
+    Parameters:
+    - `model`: the Gemini model name about to be called.
+
+    Returns nothing — it just sleeps for the remaining wait time, if any.
+    """
     last = _last_call_at.get(model, 0.0)
     elapsed = time.monotonic() - last
     if elapsed < MIN_SECONDS_BETWEEN_GEMINI_CALLS:
@@ -66,6 +75,10 @@ _client: genai.Client | None = None
 
 
 def _get_client() -> genai.Client:
+    """Returns a shared Gemini API client, creating it the first time this is
+    called and reusing it afterward. Takes no parameters; returns a
+    `genai.Client` authenticated with the API key from `.env`.
+    """
     global _client
     if _client is None:
         _client = genai.Client(api_key=GEMINI_API_KEY)
@@ -73,7 +86,19 @@ def _get_client() -> genai.Client:
 
 
 def _describe_action(action: str, action_params: dict[str, Any]) -> str:
-    """Turns an action + its params into a short phrase (e.g. "delete file (path /documents)") to embed."""
+    """Turns a step's action name and parameters into a short, readable
+    phrase that can be embedded and compared against the original goal.
+
+    Parameters:
+    - `action`: the action name as recorded on a trace step (e.g.
+      "delete_file").
+    - `action_params`: the parameters that went with that action (e.g.
+      {"path": "/documents"}).
+
+    Returns a plain-English phrase, e.g. "delete file (path /documents)",
+    or just the action name (with underscores turned into spaces) if there
+    are no parameters.
+    """
     readable_action = action.replace("_", " ")
     if not action_params:
         return readable_action
@@ -82,16 +107,22 @@ def _describe_action(action: str, action_params: dict[str, Any]) -> str:
 
 
 def _text_to_embed_for_drift(step: TraceStep) -> str:
-    """Returns the text to compare against original_goal for drift_score.
+    """Decides what text represents this step when measuring how far it has
+    drifted from the trace's original goal.
 
-    For a "tool_output_received" step, action_params is just a generic
+    Parameters:
+    - `step`: the trace step being scored.
+
+    Returns a string to embed and compare against the original goal. For a
+    "tool_output_received" step, `action_params` is just a generic
     {"tool": name} — the actual content the agent was exposed to lives in
-    input_text, not action_params. Embedding the generic label there would
-    make drift_score blind to what was actually read, regardless of how
-    aligned or misaligned that content is with the goal. For every other
-    step (a real action the agent took), the action description is still
-    the right signal — that's what captures behavioral drift, e.g. goal was
-    "read email" but the action taken was "delete files".
+    `input_text`, not `action_params`. Embedding the generic label there
+    would make drift_score blind to what was actually read, regardless of
+    how aligned or misaligned that content is with the goal. For every
+    other step (a real action the agent took), the action description
+    (from `_describe_action`) is still the right signal — that's what
+    captures behavioral drift, e.g. goal was "read email" but the action
+    taken was "delete files".
     """
     if step.action == "tool_output_received":
         return step.input_text
@@ -99,7 +130,15 @@ def _text_to_embed_for_drift(step: TraceStep) -> str:
 
 
 def _embed(text: str) -> list[float]:
-    """Embeds text via Gemini's EMBEDDING_MODEL and returns the raw vector."""
+    """Converts a piece of text into a numeric vector (an "embedding") using
+    Gemini's embedding model, so it can be compared to other text for
+    semantic similarity.
+
+    Parameters:
+    - `text`: the text to embed.
+
+    Returns the embedding as a list of floats.
+    """
     _pace_calls(EMBEDDING_MODEL)
     client = _get_client()
     response = client.models.embed_content(model=EMBEDDING_MODEL, contents=[text])
@@ -108,7 +147,17 @@ def _embed(text: str) -> list[float]:
 
 
 def _cosine_similarity(a: list[float], b: list[float]) -> float:
-    """Standard cosine similarity between two equal-length vectors; 0.0 if either is a zero vector."""
+    """Measures how similar two embedding vectors are in direction,
+    regardless of their magnitude — the standard way to compare embeddings
+    for semantic closeness.
+
+    Parameters:
+    - `a`, `b`: two equal-length embedding vectors.
+
+    Returns a similarity score, normally between -1.0 and 1.0 (1.0 = same
+    direction/meaning, 0.0 = unrelated, -1.0 = opposite). Returns 0.0 if
+    either vector is all zeros, to avoid a divide-by-zero error.
+    """
     dot = sum(x * y for x, y in zip(a, b, strict=True))
     norm_a = math.sqrt(sum(x * x for x in a))
     norm_b = math.sqrt(sum(y * y for y in b))
@@ -118,7 +167,22 @@ def _cosine_similarity(a: list[float], b: list[float]) -> float:
 
 
 def _classify_injection(input_text: str) -> float:
-    """Returns a 0-1 confidence that input_text is an injected instruction rather than a normal task continuation."""
+    """Asks Gemini (acting as a "judge" model) to rate how much a piece of
+    text looks like an injected instruction — an attempt to redirect the
+    agent — rather than a normal continuation of its task. Uses
+    `INJECTION_CLASSIFIER_PROMPT`, which includes calibration examples so
+    the judge keys off the text's structure (commanding/redirecting
+    language) rather than just its topic.
+
+    Parameters:
+    - `input_text`: the text to evaluate (usually a step's `input_text`,
+      e.g. the body of an email the agent just read).
+
+    Returns a confidence score between 0.0 (definitely not an injected
+    instruction) and 1.0 (definitely is one). Defaults to 0.5 if the model's
+    response can't be parsed as a number, so a malformed response reads as
+    "uncertain" rather than crashing or silently scoring as safe.
+    """
     _pace_calls(JUDGE_MODEL)
     client = _get_client()
     response = client.models.generate_content(
@@ -135,14 +199,23 @@ def _classify_injection(input_text: str) -> float:
 
 
 def compute_drift_and_risk(trace: Trace, step_id: int) -> tuple[float, int]:
-    """Returns (drift_score, risk_score) for the given step of the trace.
+    """The main entry point of the Intent Drift Engine: scores one step of a
+    trace for how much it has drifted from the agent's original goal, and
+    how risky it looks overall.
 
-    drift_score = 1 - cosine_similarity between embeddings of the trace's
-    original_goal and a short description of the step's action — low
-    similarity to the stated goal means high drift. risk_score blends
-    drift_score with a Gemini judge's 0-1 confidence that the step's
-    input_text looks like an injected instruction, weighted by
-    DRIFT_SCORE_WEIGHT / INJECTION_CONFIDENCE_WEIGHT (config.py).
+    Parameters:
+    - `trace`: the full trace the step belongs to (used to read
+      `trace.original_goal` and find the step by id).
+    - `step_id`: which step in the trace to score.
+
+    Returns a `(drift_score, risk_score)` tuple:
+    - `drift_score` (0.0-1.0): `1 - cosine_similarity` between embeddings of
+      the trace's `original_goal` and a description of this step's action —
+      low similarity to the stated goal means high drift.
+    - `risk_score` (0-100 integer): blends `drift_score` with a Gemini
+      judge's 0-1 confidence that the step's `input_text` looks like an
+      injected instruction, weighted by `DRIFT_SCORE_WEIGHT` /
+      `INJECTION_CONFIDENCE_WEIGHT` (see `config.py`), then scaled to 0-100.
     """
     step = next(s for s in trace.steps if s.step_id == step_id)
 

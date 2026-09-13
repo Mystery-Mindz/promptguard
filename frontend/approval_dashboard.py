@@ -1,3 +1,14 @@
+"""Operator Approval Console (Streamlit, runs on port 8502).
+
+A human-reviewer-facing page for deciding on steps PromptGuard has flagged
+as needing approval. Flow: enter the shared demo token to "authenticate",
+then the console polls the backend (GET /pending-approvals) for the oldest
+still-undecided flagged step, shows its risk details, and lets the
+operator Approve or Deny it (POST /approval-decision via
+utils.submit_approval). Reviews one pending item at a time; a multi-item
+queue view is future work, not a bug.
+"""
+
 import streamlit as st
 from config import APPROVAL_TOKEN
 from utils import submit_approval, get_pending_approvals

@@ -1,3 +1,13 @@
+"""Centralized configuration for the PromptGuard backend.
+
+This is the only place tunable values (API keys, model names, gate
+thresholds, scoring weights, timing, and file paths) should be set — every
+other module imports from here rather than hardcoding its own copy, so a
+value only ever needs to change in one place. See the comment above each
+group of constants below for what it controls and why its current value
+was chosen.
+"""
+
 import os
 
 from dotenv import load_dotenv

@@ -74,6 +74,14 @@ _client: genai.Client | None = None
 
 
 def _get_client() -> genai.Client:
+    """Returns a shared Gemini API client, creating it the first time this is
+    called and reusing it on every later call (so the app doesn't open a new
+    connection for every request).
+
+    Takes no parameters. Returns a `genai.Client` configured with the API
+    key from `.env` and a connection timeout (`GEMINI_CLIENT_TIMEOUT_MS`)
+    so a stalled network call can't hang forever.
+    """
     global _client
     if _client is None:
         # Explicit timeout so a stalled connection can't hang a call
@@ -83,12 +91,24 @@ def _get_client() -> genai.Client:
 
 
 def _now() -> datetime:
+    """Returns the current UTC time, used to timestamp each trace step.
+    Returned as a `datetime` (not a pre-formatted string) since that's what
+    `TraceStep.timestamp` expects — Pydantic serializes it to an ISO-8601
+    string (e.g. "2026-09-13T23:04:00+00:00") automatically when the trace
+    is returned as JSON."""
     return datetime.now(timezone.utc)
 
 
 def _pace_calls() -> None:
-    """Sleeps as needed to keep generate_content calls at least
-    MIN_SECONDS_BETWEEN_GEMINI_CALLS apart, staying under the free-tier quota."""
+    """Pauses execution (if needed) so that consecutive calls to Gemini's
+    `generate_content` are always at least `MIN_SECONDS_BETWEEN_GEMINI_CALLS`
+    seconds apart. This keeps the agent loop under Gemini's free-tier rate
+    limit instead of hitting 429 "too many requests" errors.
+
+    Takes no parameters and returns nothing — it just sleeps for the
+    remaining wait time, if any, before the caller proceeds with its next
+    Gemini call.
+    """
     global _last_call_at
     elapsed = time.monotonic() - _last_call_at
     if elapsed < MIN_SECONDS_BETWEEN_GEMINI_CALLS:
@@ -97,15 +117,30 @@ def _pace_calls() -> None:
 
 
 def run_agent(original_goal: str, trace_id: str, agent_id: str = "agent_A") -> Trace:
-    """Runs the Gemini tool-calling loop for original_goal against the mock tools
-    in tools.py, and returns a Trace recording every step taken.
+    """Runs a simulated AI agent that tries to accomplish `original_goal` by
+    calling the mock tools in `tools.py` (read_email, delete_file,
+    send_message), one step at a time, using Gemini's function-calling to
+    decide which tool to call and with what arguments.
 
-    Each step's input_source/input_provenance reflects what drove that action:
-    it starts as the user's own goal (internal), and flips to tool_output/
-    external the moment the agent reads content it doesn't control (e.g. an
-    email body) — every action taken afterward inherits that provenance until
-    fresh trusted input replaces it. Stops after AGENT_MAX_STEPS or once the model
-    makes no further tool calls.
+    Parameters:
+    - `original_goal`: the plain-English task given to the agent (e.g.
+      "Read my inbox and summarize anything urgent").
+    - `trace_id`: the identifier to stamp on the resulting Trace, so it can
+      be looked up later (e.g. via GET /trace/{trace_id}).
+    - `agent_id`: which agent is "acting" in this run (defaults to
+      "agent_A"); recorded on every step so multi-agent handoffs can be
+      told apart.
+
+    Returns a `Trace` — a record of every step the agent took, in order.
+    Each step's input_source/input_provenance reflects what drove that
+    action: it starts as the user's own goal (internal), and flips to
+    tool_output/external the moment the agent reads content it doesn't
+    control (e.g. an email body) — every action taken afterward inherits
+    that provenance until fresh trusted input replaces it. This is what
+    lets a later step be caught as "acting on untrusted content" even if
+    the untrusted content was read several steps earlier. The loop stops
+    after `AGENT_MAX_STEPS` steps or as soon as the model stops requesting
+    tool calls, whichever comes first.
     """
     client = _get_client()
 

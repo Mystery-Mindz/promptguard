@@ -40,10 +40,32 @@ storage.init_db()
 
 @app.post("/run-agent", response_model=Trace)
 def run_agent_endpoint(request: RunAgentRequest) -> Trace:
+    """API endpoint: `POST /run-agent`. Runs the simulated AI agent
+    (`agent.run_agent`) against a goal and returns the resulting trace — but
+    does NOT run it through detection or save it; call `POST /analyze-trace`
+    with the returned trace afterward to do that.
+
+    Parameters (from the request body, see `RunAgentRequest`):
+    - `original_goal`: the task to give the agent.
+    - `trace_id`: identifier for the resulting trace (has a default).
+    - `agent_id`: which agent is acting (has a default).
+
+    Returns the resulting `Trace`.
+    """
     return run_agent(request.original_goal, request.trace_id, request.agent_id)
 
 
 def _classification_for(risk_score: int) -> Classification:
+    """Maps a numeric risk score to a human-readable label, using the same
+    thresholds as `gate.decide` (so the label always agrees with the
+    decision it's shown alongside).
+
+    Parameters:
+    - `risk_score`: 0-100 risk score for a step.
+
+    Returns `"malicious"` (above `RISK_BLOCK_THRESHOLD`), `"suspicious"`
+    (within the approval-required band), or `"clean"` (otherwise).
+    """
     if risk_score > RISK_BLOCK_THRESHOLD:
         return "malicious"
     if RISK_APPROVAL_LOW_THRESHOLD <= risk_score <= RISK_APPROVAL_HIGH_THRESHOLD:
@@ -52,6 +74,20 @@ def _classification_for(risk_score: int) -> Classification:
 
 
 def _explanation_for(step: TraceStep, drift_score: float, risk_score: int, provenance_flag: ProvenanceFlag) -> str:
+    """Builds the plain-English `explanation` string shown alongside a
+    step's detection result, so a human reviewer can see at a glance why a
+    step was scored the way it was.
+
+    Parameters:
+    - `step`: the trace step being explained.
+    - `drift_score`, `risk_score`: this step's computed scores.
+    - `provenance_flag`: this step's provenance flag.
+
+    Returns a string like "Step 2 (delete_file): drift_score=0.83,
+    risk_score=87, input is externally sourced" — always includes the
+    scores, and adds a note about provenance when the step is `"tainted"`
+    or `"external"`.
+    """
     reasons = [f"drift_score={drift_score:.2f}", f"risk_score={risk_score}"]
     if provenance_flag == "tainted":
         reasons.append("input traces back to external content via an agent handoff")
@@ -62,6 +98,20 @@ def _explanation_for(step: TraceStep, drift_score: float, risk_score: int, prove
 
 @app.post("/analyze-trace", response_model=list[DetectionOutput])
 def analyze_trace(trace: Trace) -> list[DetectionOutput]:
+    """API endpoint: `POST /analyze-trace`. The core of PromptGuard: runs
+    every step of a trace through the full detection pipeline (Intent
+    Drift Engine → Provenance Tracer → Secure Execution Gate), saves both
+    the trace itself and each step's result, and returns the results.
+
+    Parameters (request body): a `Trace` — can come from `run_agent`, or be
+    hand-built/loaded from a test file; either way it just needs to match
+    the shared trace JSON schema.
+
+    Returns a list of `DetectionOutput`, one per step, in step order. As a
+    side effect, persists the trace (so it can be looked up later via
+    `GET /trace/{trace_id}`) and each detection result (so
+    `GET /pending-approvals` and `POST /approval-decision` can see it).
+    """
     storage.save_trace(trace)
     outputs: list[DetectionOutput] = []
 
@@ -88,6 +138,17 @@ def analyze_trace(trace: Trace) -> list[DetectionOutput]:
 
 @app.get("/trace/{trace_id}", response_model=TraceWithDetections)
 def get_trace_endpoint(trace_id: str) -> TraceWithDetections:
+    """API endpoint: `GET /trace/{trace_id}`. Looks up a previously-analyzed
+    trace by ID, so a client (e.g. the dashboard) can display its real,
+    stored results instead of re-sending a fixed payload.
+
+    Parameters:
+    - `trace_id` (URL path parameter): the trace to look up.
+
+    Returns a `TraceWithDetections` — the original trace plus every step's
+    detection result. Responds with 404 if no trace with this ID was ever
+    analyzed via `POST /analyze-trace`.
+    """
     trace = storage.get_trace(trace_id)
     if trace is None:
         raise HTTPException(
@@ -101,6 +162,14 @@ def get_trace_endpoint(trace_id: str) -> TraceWithDetections:
 
 @app.get("/pending-approvals", response_model=list[PendingApproval])
 def pending_approvals_endpoint() -> list[PendingApproval]:
+    """API endpoint: `GET /pending-approvals`. Lets the Operator Approval
+    Console poll for real work — every step currently awaiting a human
+    decision.
+
+    Takes no parameters. Returns a list of `PendingApproval` (oldest
+    first): every step flagged `approval_required` by `/analyze-trace`
+    that hasn't been approved or denied yet.
+    """
     return [
         PendingApproval(
             trace_id=row["trace_id"],
@@ -116,6 +185,24 @@ def pending_approvals_endpoint() -> list[PendingApproval]:
 
 @app.post("/approval-decision", response_model=ApprovalDecisionResponse)
 def approval_decision_endpoint(request: ApprovalDecisionRequest) -> ApprovalDecisionResponse:
+    """API endpoint: `POST /approval-decision`. Records a human operator's
+    approve/deny call on a step that PromptGuard flagged for review. This
+    decision must come from the request body (a real human action on a
+    separate, authenticated channel) — never derived from the trace's own
+    content, to avoid a "confused deputy" bug where flagged content could
+    approve itself.
+
+    Parameters (request body, see `ApprovalDecisionRequest`):
+    - `trace_id`, `step_id`: which step is being decided on.
+    - `operator_decision`: `"approved"` or `"denied"`.
+    - `operator_id`: optional identifier for who decided.
+
+    Returns an `ApprovalDecisionResponse` with the resulting `final_status`
+    (`"approved_and_allowed"` or `"denied_and_blocked"`) and a timestamp.
+    Responds with 404 if this step was never analyzed, or 409 if it either
+    wasn't flagged `approval_required` in the first place, or was already
+    decided (a decision can't be changed once made).
+    """
     stored_decision = storage.get_detection_decision(request.trace_id, request.step_id)
 
     if stored_decision is None:
