@@ -44,6 +44,11 @@ if token != APPROVAL_TOKEN:
     st.warning("Authentication required.")
     st.stop()
 
+operator_id = st.text_input(
+    "Operator ID (attributed on each decision)",
+    value="reviewer_jane",
+)
+
 
 # ---------------------------------------------------------
 # Authenticated operator area
@@ -59,6 +64,9 @@ if not pending_approvals:
     st.success("No approval requests are currently pending.")
     st.stop()
 
+# Intentional: reviews one pending item at a time, oldest first (the backend
+# already orders by created_at ASC) — not a bug, just today's simplest UX.
+# A multi-item queue view is future work, not a leftover shortcut.
 approval_request = pending_approvals[0]
 
 
@@ -153,7 +161,7 @@ with approve_col:
             trace_id=approval_request["trace_id"],
             step_id=approval_request["step_id"],
             operator_decision="approved",
-            operator_id="reviewer_jane",
+            operator_id=operator_id,
         )
 
         st.session_state.approval_status = "approved"
@@ -175,7 +183,7 @@ with deny_col:
             trace_id=approval_request["trace_id"],
             step_id=approval_request["step_id"],
             operator_decision="denied",
-            operator_id="reviewer_jane",
+            operator_id=operator_id,
         )
 
         st.session_state.approval_status = "denied"
