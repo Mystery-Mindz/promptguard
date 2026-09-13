@@ -14,6 +14,7 @@ from app.schemas import (
     ApprovalDecisionResponse,
     Classification,
     DetectionOutput,
+    FinalStatus,
     PendingApproval,
     ProvenanceFlag,
     RunAgentRequest,
@@ -140,7 +141,7 @@ def approval_decision_endpoint(request: ApprovalDecisionRequest) -> ApprovalDeci
             "a decision cannot be changed once made.",
         )
 
-    final_status: str = "approved_and_allowed" if request.operator_decision == "approved" else "denied_and_blocked"
+    final_status: FinalStatus = "approved_and_allowed" if request.operator_decision == "approved" else "denied_and_blocked"
     timestamp = datetime.now(timezone.utc)
 
     storage.save_approval_decision(

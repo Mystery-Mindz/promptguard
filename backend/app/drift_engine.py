@@ -103,12 +103,13 @@ def _embed(text: str) -> list[float]:
     _pace_calls(EMBEDDING_MODEL)
     client = _get_client()
     response = client.models.embed_content(model=EMBEDDING_MODEL, contents=[text])
-    return list(response.embeddings[0].values)
+    assert response.embeddings, "embed_content returned no embeddings"
+    return list(response.embeddings[0].values or [])
 
 
 def _cosine_similarity(a: list[float], b: list[float]) -> float:
     """Standard cosine similarity between two equal-length vectors; 0.0 if either is a zero vector."""
-    dot = sum(x * y for x, y in zip(a, b))
+    dot = sum(x * y for x, y in zip(a, b, strict=True))
     norm_a = math.sqrt(sum(x * x for x in a))
     norm_b = math.sqrt(sum(y * y for y in b))
     if norm_a == 0 or norm_b == 0:

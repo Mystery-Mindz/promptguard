@@ -1,6 +1,6 @@
 import time
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Callable
 
 from google import genai
 from google.genai import types
@@ -64,7 +64,7 @@ GENERATE_CONFIG = types.GenerateContentConfig(
     tools=[types.Tool(function_declarations=TOOL_DECLARATIONS)],
 )
 
-TOOL_FUNCTIONS = {
+TOOL_FUNCTIONS: dict[str, Callable[..., Any]] = {
     "read_email": read_email,
     "delete_file": delete_file,
     "send_message": send_message,
@@ -82,8 +82,8 @@ def _get_client() -> genai.Client:
     return _client
 
 
-def _now() -> str:
-    return datetime.now(timezone.utc).isoformat()
+def _now() -> datetime:
+    return datetime.now(timezone.utc)
 
 
 def _pace_calls() -> None:
@@ -136,12 +136,16 @@ def run_agent(original_goal: str, trace_id: str, agent_id: str = "agent_A") -> T
             break
 
         # Preserve the model's turn (text + function call parts) in the conversation.
-        contents.append(response.candidates[0].content)
+        assert response.candidates, "generate_content returned function_calls but no candidates"
+        model_turn = response.candidates[0].content
+        assert model_turn, "the model's candidate had no content"
+        contents.append(model_turn)
 
         for call in function_calls:
             if len(steps) >= AGENT_MAX_STEPS:
                 break
 
+            assert call.name, "a function call from Gemini had no tool name"
             name = call.name
             args: dict[str, Any] = dict(call.args or {})
             result = TOOL_FUNCTIONS[name](**args)
