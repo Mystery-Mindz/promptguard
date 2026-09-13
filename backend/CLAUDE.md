@@ -35,8 +35,10 @@ This repo contains the **backend only**. A separate Streamlit frontend (built by
   drift_engine.py  # Intent Drift Engine
   provenance.py    # Provenance Tracer (NetworkX graph)
   gate.py          # Secure Execution Gate (decision logic)
-  storage.py       # SQLite persistence for detection outputs + approval decisions
-  config.py        # Thresholds, model names, API key loading — ALL tunable values live here, nowhere else
+  storage.py       # SQLite persistence for traces, detection outputs, and approval decisions
+  config.py        # Thresholds, model names, timing/timeout values, API key loading — ALL tunable values live here, nowhere else
+generate_traces.py # Generates the synthetic test-data/traces/*.json fixtures used by run_validation.py
+run_validation.py  # Validates /analyze-trace against test-data/traces and test-data/agentdojo_subset (see test-data/validation_results.md)
 requirements.txt
 .env               # GEMINI_API_KEY (never commit this file)
 tests/
@@ -89,6 +91,33 @@ Two teammates (frontend + test data) are building against these exact JSON shape
 `provenance_flag` is one of: `internal`, `external`, `tainted` (tainted = looks internal but traces back to an external origin — this is the cross-agent case).
 `classification` is one of: `clean`, `suspicious`, `malicious`.
 `decision` is one of: `block`, `approval_required`, `allow_logged`.
+
+### Trace-with-detections format (what `GET /trace/{trace_id}` returns)
+
+`/analyze-trace` now persists the trace itself (`traces`/`trace_steps` tables), not just its detection outputs — this endpoint reads that back for a `trace_id` previously analyzed, wrapping the original Trace input format and Detection output format above together:
+```json
+{
+  "trace": {
+    "trace_id": "trace_001",
+    "agent_id": "agent_A",
+    "original_goal": "Read and summarize today's emails",
+    "steps": [ /* ...same TraceStep shape as the Trace input format above... */ ]
+  },
+  "detections": [
+    {
+      "trace_id": "trace_001",
+      "step_id": 2,
+      "drift_score": 0.83,
+      "risk_score": 87,
+      "provenance_flag": "external",
+      "classification": "malicious",
+      "explanation": "Agent was asked to read email but is now attempting to delete files.",
+      "decision": "block"
+    }
+  ]
+}
+```
+404 (`{"detail": "..."}`) if `trace_id` was never analyzed via `/analyze-trace`.
 
 ### Approval decision format (added 2026-09-08 — request/response for `POST /approval-decision`)
 
