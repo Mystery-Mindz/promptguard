@@ -26,11 +26,16 @@ from app.schemas import (
 
 app = FastAPI(title="PromptGuard")
 
-# Allow the frontend (Streamlit, typically on 8501/8502) to call this API
-# from any localhost port — the two run as separate processes/ports.
+# Allow the frontend to call this API from:
+#  - any localhost/127.0.0.1 port (local dev — Streamlit runs on 8501/8502
+#    as two separate processes, and the port can vary)
+#  - any *.streamlit.app subdomain over HTTPS (Streamlit Cloud, where the
+#    deployed frontend actually lives — a real internet URL, not localhost)
+# Anchored at both ends so this can't be satisfied by, e.g., a domain that
+# merely contains "streamlit.app" as a substring (https://streamlit.app.evil.com).
 app.add_middleware(
     CORSMiddleware,
-    allow_origin_regex=r"^https?://(localhost|127\.0\.0\.1):\d+$",
+    allow_origin_regex=r"^https?://(localhost|127\.0\.0\.1):\d+$|^https://([a-zA-Z0-9-]+\.)*streamlit\.app$",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
