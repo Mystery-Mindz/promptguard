@@ -59,6 +59,8 @@ python scripts/live_check.py --with-agent               # real end-to-end check 
 ### BUG-04 · MEDIUM · A Gemini error mid-analysis returns a bare 500 and leaves half-saved data
 `/analyze-trace` saves the trace first, then scores step by step. A 429 or quota error on step 3 gives a raw 500 with steps 1–2 saved and step 3 missing. **Fix:** catch model errors and return 503 with a clear message (e.g. `"Model quota exhausted"`), and don't persist partial results (or mark the trace `incomplete`). Test: `test_bug04_*`.
 
+**Fixed (2026-10-19):** `analyze_trace` now catches any exception from `compute_drift_and_risk` per step, deletes the trace entirely via a new `storage.delete_trace` (one transaction, covers `traces`/`trace_steps`/`detection_outputs`/`approval_decisions`), and raises `HTTPException(503, detail=...)` with a readable message instead of a bare 500. `test_bug04_*` passes now (de-xfailed) and was extended to assert `storage.get_trace(...)` returns `None` afterward — no half-saved trace.
+
 ### BUG-05 · HIGH · Analysis is too slow and too quota-hungry to demo live
 - Pacing is 13 s between calls **per model**, and every step makes **2 embedding calls** (the original goal is re-embedded for every step) + 1 judge call. A 5-step trace needs at least ~2 min. The dashboard timeout is 90 s, and `run_validation.py --base-url` uses a **30 s** timeout, so validating against a running server always times out.
 - Full validation = 53 judge + 106 embedding calls, which is more than the free daily quota (~20/model/day). **The 26/26 result can't be reproduced in one day on the free tier.**

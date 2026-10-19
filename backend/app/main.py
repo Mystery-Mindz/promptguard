@@ -145,12 +145,27 @@ def analyze_trace(trace: Trace) -> list[DetectionOutput]:
     side effect, persists the trace (so it can be looked up later via
     `GET /trace/{trace_id}`) and each detection result (so
     `GET /pending-approvals` and `POST /approval-decision` can see it).
+
+    If the drift engine's underlying Gemini call fails partway through
+    (e.g. a 429/503 from the model provider), responds with 503 and a
+    readable `detail` message instead of a bare 500 — and deletes the
+    trace entirely rather than leaving some steps scored and others
+    missing; retry `/analyze-trace` from scratch once the error clears.
     """
     storage.save_trace(trace)
     outputs: list[DetectionOutput] = []
 
     for step in trace.steps:
-        drift_score, risk_score = compute_drift_and_risk(trace, step.step_id)
+        try:
+            drift_score, risk_score = compute_drift_and_risk(trace, step.step_id)
+        except Exception as e:
+            storage.delete_trace(trace.trace_id)
+            raise HTTPException(
+                status_code=503,
+                detail=f"Detection model is currently unavailable, analyzing trace_id={trace.trace_id!r} "
+                f"step {step.step_id} failed: {e}",
+            ) from e
+
         provenance_flag = get_provenance_flag(trace, step.step_id)
         decision = decide(risk_score, provenance_flag)
 

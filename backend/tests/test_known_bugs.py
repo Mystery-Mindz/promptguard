@@ -182,7 +182,6 @@ def test_bug03_run_agent_survives_tool_call_with_missing_arguments():
 # --- BUG-04: a judge/embedding failure mid-trace returns a bare 500 ---------
 
 
-@known_bug
 def test_bug04_model_failure_returns_clean_error_not_500():
     trace = {
         "trace_id": "quota_test",
@@ -205,3 +204,4 @@ def test_bug04_model_failure_returns_clean_error_not_500():
         response = TestClient(app, raise_server_exceptions=False).post("/analyze-trace", json=trace)
     assert response.status_code in (502, 503), f"got {response.status_code}; expected a clear upstream-error status"
     assert "detail" in response.json()
+    assert storage.get_trace("quota_test") is None, "a trace that failed mid-analysis must not half-persist"

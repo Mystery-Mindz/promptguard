@@ -103,6 +103,23 @@ def init_db() -> None:
         )
 
 
+def _delete_trace_rows(conn: sqlite3.Connection, trace_id: str) -> None:
+    """Deletes every row derived from a trace_id across `trace_steps`,
+    `detection_outputs`, and `approval_decisions` (but not the `traces` row
+    itself), using the caller's already-open connection so the deletes
+    share the caller's transaction.
+
+    Parameters:
+    - `conn`: an open connection (inside a `with _connect() as conn:` block).
+    - `trace_id`: the trace whose derived rows should be deleted.
+
+    Returns nothing.
+    """
+    conn.execute("DELETE FROM trace_steps WHERE trace_id = ?", (trace_id,))
+    conn.execute("DELETE FROM detection_outputs WHERE trace_id = ?", (trace_id,))
+    conn.execute("DELETE FROM approval_decisions WHERE trace_id = ?", (trace_id,))
+
+
 def save_trace(trace: Trace) -> None:
     """Saves a full trace — its `agent_id`, `original_goal`, and every
     step's complete data — into the `traces` and `trace_steps` tables.
@@ -123,9 +140,7 @@ def save_trace(trace: Trace) -> None:
     decision (both were confirmed bugs: BUG-01).
     """
     with _connect() as conn:
-        conn.execute("DELETE FROM trace_steps WHERE trace_id = ?", (trace.trace_id,))
-        conn.execute("DELETE FROM detection_outputs WHERE trace_id = ?", (trace.trace_id,))
-        conn.execute("DELETE FROM approval_decisions WHERE trace_id = ?", (trace.trace_id,))
+        _delete_trace_rows(conn, trace.trace_id)
 
         conn.execute(
             "INSERT OR REPLACE INTO traces (trace_id, agent_id, original_goal) VALUES (?, ?, ?)",
@@ -197,6 +212,24 @@ def get_trace(trace_id: str) -> Trace | None:
         original_goal=trace_row["original_goal"],
         steps=steps,
     )
+
+
+def delete_trace(trace_id: str) -> None:
+    """Deletes a trace and everything derived from it — its steps,
+    detection outputs, and approval decisions — in one transaction. Used
+    by `POST /analyze-trace` when a model/provider error interrupts
+    analysis partway through, so a trace with some steps scored and others
+    missing never persists (BUG-04); the caller should retry
+    `/analyze-trace` from scratch once the underlying error clears.
+
+    Parameters:
+    - `trace_id`: the trace to delete entirely.
+
+    Returns nothing. Safe to call even if `trace_id` was never saved.
+    """
+    with _connect() as conn:
+        _delete_trace_rows(conn, trace_id)
+        conn.execute("DELETE FROM traces WHERE trace_id = ?", (trace_id,))
 
 
 def get_detection_outputs_for_trace(trace_id: str) -> list[dict]:
