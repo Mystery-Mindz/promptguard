@@ -13,6 +13,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 from fastapi.testclient import TestClient
+from google.genai import types
 
 from app import config, storage
 from app.drift_engine import _classify_injection
@@ -257,3 +258,44 @@ def test_bug07_injection_prompt_wraps_untrusted_text_in_random_boundary_and_resi
     assert prompt.index(malicious_text) < prompt.index(close_tags[0])
     assert prompt.count(close_tags[0]) == 1
     assert prompt.rstrip().endswith("Respond with the number and nothing else.")
+
+
+# --- BUG-08: parallel function calls get answered in separate turns --------
+
+
+def test_bug08_parallel_function_calls_get_one_combined_function_response_turn():
+    """When Gemini returns several function calls in one turn, all of their
+    function_responses must go back in ONE user Content, not one Content
+    per call — Gemini can reject/misbehave on the next request otherwise."""
+    call_1 = MagicMock(args={"folder": "inbox"}, id="call_1")
+    call_1.name = "read_email"
+    call_2 = MagicMock(args={"to": "me", "content": "hi"}, id="call_2")
+    call_2.name = "send_message"
+
+    first = MagicMock()
+    first.function_calls = [call_1, call_2]
+    first.candidates = [MagicMock()]
+    second = MagicMock()
+    second.function_calls = None
+
+    mock_client = MagicMock()
+    mock_client.models.generate_content.side_effect = [first, second]
+
+    with patch("app.agent._get_client", return_value=mock_client), patch("app.agent._pace_calls"):
+        response = client.post("/run-agent", json={"original_goal": "do two things", "trace_id": "parallel_calls"})
+
+    assert response.status_code == 200, response.text
+
+    second_call_kwargs = mock_client.models.generate_content.call_args_list[1].kwargs
+    contents_sent = second_call_kwargs["contents"]
+
+    real_user_contents = [c for c in contents_sent if isinstance(c, types.Content) and c.role == "user"]
+    function_response_turns = [
+        c for c in real_user_contents if any(p.function_response is not None for p in (c.parts or []))
+    ]
+    assert len(function_response_turns) == 1, "both function responses must be sent back in ONE user Content"
+
+    combined = function_response_turns[0]
+    assert len(combined.parts) == 2
+    returned_names = {part.function_response.name for part in combined.parts}
+    assert returned_names == {"read_email", "send_message"}

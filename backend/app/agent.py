@@ -183,6 +183,14 @@ def run_agent(original_goal: str, trace_id: str, agent_id: str = "agent_A") -> T
         assert model_turn, "the model's candidate had no content"
         contents.append(model_turn)
 
+        # Gemini expects every function_response for one model turn to come
+        # back together in a single user Content, not one Content per call —
+        # sending them as separate turns (as this used to do) can make the
+        # next request to the model reject or misbehave when the model
+        # returned several function calls at once. Collect them here and
+        # append ONE combined Content after the loop (BUG-08).
+        response_parts: list[types.Part] = []
+
         for call in function_calls:
             if len(steps) >= AGENT_MAX_STEPS:
                 break
@@ -220,18 +228,13 @@ def run_agent(original_goal: str, trace_id: str, agent_id: str = "agent_A") -> T
                         timestamp=_now(),
                     )
                 )
-                contents.append(
-                    types.Content(
-                        role="user",
-                        parts=[
-                            types.Part(
-                                function_response=types.FunctionResponse(
-                                    id=call.id,
-                                    name=name,
-                                    response={"error": f"tool '{name}' is not available"},
-                                )
-                            )
-                        ],
+                response_parts.append(
+                    types.Part(
+                        function_response=types.FunctionResponse(
+                            id=call.id,
+                            name=name,
+                            response={"error": f"tool '{name}' is not available"},
+                        )
                     )
                 )
                 continue
@@ -258,18 +261,13 @@ def run_agent(original_goal: str, trace_id: str, agent_id: str = "agent_A") -> T
                         timestamp=_now(),
                     )
                 )
-                contents.append(
-                    types.Content(
-                        role="user",
-                        parts=[
-                            types.Part(
-                                function_response=types.FunctionResponse(
-                                    id=call.id,
-                                    name=name,
-                                    response={"error": f"invalid arguments for tool '{name}': {e}"},
-                                )
-                            )
-                        ],
+                response_parts.append(
+                    types.Part(
+                        function_response=types.FunctionResponse(
+                            id=call.id,
+                            name=name,
+                            response={"error": f"invalid arguments for tool '{name}': {e}"},
+                        )
                     )
                 )
                 continue
@@ -287,18 +285,13 @@ def run_agent(original_goal: str, trace_id: str, agent_id: str = "agent_A") -> T
                 )
             )
 
-            contents.append(
-                types.Content(
-                    role="user",
-                    parts=[
-                        types.Part(
-                            function_response=types.FunctionResponse(
-                                id=call.id,
-                                name=name,
-                                response={"result": result},
-                            )
-                        )
-                    ],
+            response_parts.append(
+                types.Part(
+                    function_response=types.FunctionResponse(
+                        id=call.id,
+                        name=name,
+                        response={"result": result},
+                    )
                 )
             )
 
@@ -331,5 +324,8 @@ def run_agent(original_goal: str, trace_id: str, agent_id: str = "agent_A") -> T
                             timestamp=_now(),
                         )
                     )
+
+        if response_parts:
+            contents.append(types.Content(role="user", parts=response_parts))
 
     return Trace(trace_id=trace_id, agent_id=agent_id, original_goal=original_goal, steps=steps)

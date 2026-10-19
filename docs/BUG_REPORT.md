@@ -77,6 +77,8 @@ The operator token is only checked inside the Streamlit page. `POST /approval-de
 ### BUG-08 · MEDIUM (likely) · Parallel tool calls are answered in separate turns
 When Gemini returns several function calls in one turn, `agent.py` appends **one user turn per response**. Gemini expects all function responses for a turn together in a single turn, so this can make the API reject the next request. Not verified live. **Fix:** collect all function responses for a model turn into one `Content`.
 
+**Fixed (2026-10-19):** All three branches that handle a function call (hallucinated tool, invalid arguments, successful call) now append their `function_response` `Part` to a shared `response_parts` list instead of each appending its own `Content` immediately; one combined `types.Content(role="user", parts=response_parts)` is appended once after the `for call in function_calls` loop finishes. New unit test `test_bug08_parallel_function_calls_get_one_combined_function_response_turn` (mocked client, two function calls in one turn) asserts the second `generate_content` call's `contents` contains exactly one `user` `Content` holding both `function_response`s.
+
 ### BUG-09 · MEDIUM · Approval console problems
 - After approving item 1, the **next** item shows "✅ Action approved" because `st.session_state.approval_status` is never reset.
 - A 409, a 404 or the backend being down shows a raw Python traceback.
