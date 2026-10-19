@@ -10,6 +10,8 @@ Classification = Literal["clean", "suspicious", "malicious"]
 Decision = Literal["block", "approval_required", "allow_logged"]
 OperatorDecision = Literal["approved", "denied"]
 FinalStatus = Literal["approved_and_allowed", "denied_and_blocked"]
+GuardApprovalStatus = Literal["not_required", "pending"]
+GuardApprovalState = Literal["pending", "approved", "denied"]
 
 
 class TraceStep(BaseModel):
@@ -75,3 +77,53 @@ class PendingApproval(BaseModel):
 class TraceWithDetections(BaseModel):
     trace: Trace
     detections: list[DetectionOutput]
+
+
+# --- /guard/* contract (see docs/plan/00_OVERVIEW.md, section A) -----------
+
+
+class GuardSessionRequest(BaseModel):
+    agent_id: str
+    original_goal: str
+
+
+class GuardSessionResponse(BaseModel):
+    session_id: str
+
+
+class GuardObserveRequest(BaseModel):
+    session_id: str
+    actor: str
+    input_text: str
+    input_source: InputSource
+    input_provenance: InputProvenance
+
+
+class GuardCheckRequest(BaseModel):
+    session_id: str
+    actor: str
+    input_text: str
+    input_source: InputSource
+    input_provenance: InputProvenance
+    action: str
+    action_params: dict[str, Any]
+
+
+class GuardCheckResponse(DetectionOutput):
+    approval_status: GuardApprovalStatus
+
+
+class GuardApprovalResponse(BaseModel):
+    status: GuardApprovalState
+    decided_by: str | None = None
+    decided_at: datetime | None = None
+
+
+class GuardSessionSummary(BaseModel):
+    session_id: str
+    agent_id: str
+    original_goal: str
+    created_at: datetime
+    step_count: int
+    max_risk: int | None = None
+    worst_decision: Decision | None = None

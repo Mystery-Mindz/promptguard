@@ -3,9 +3,29 @@ from app.config import (
     RISK_APPROVAL_LOW_THRESHOLD,
     RISK_BLOCK_THRESHOLD,
 )
-from app.schemas import Decision, ProvenanceFlag
+from app.schemas import Classification, Decision, ProvenanceFlag
 
 _DECISION_SEVERITY = {"allow_logged": 0, "approval_required": 1, "block": 2}
+
+
+def classification_for(risk_score: int) -> Classification:
+    """Maps a numeric risk score to a human-readable label, using the same
+    thresholds as `decide` (so the label always agrees with the decision
+    it's shown alongside). Shared by `/analyze-trace` and `/guard/*` so
+    both ways of scoring a step report a classification with the same
+    meaning.
+
+    Parameters:
+    - `risk_score`: 0-100 risk score for a step.
+
+    Returns `"malicious"` (above `RISK_BLOCK_THRESHOLD`), `"suspicious"`
+    (within the approval-required band), or `"clean"` (otherwise).
+    """
+    if risk_score > RISK_BLOCK_THRESHOLD:
+        return "malicious"
+    if RISK_APPROVAL_LOW_THRESHOLD <= risk_score <= RISK_APPROVAL_HIGH_THRESHOLD:
+        return "suspicious"
+    return "clean"
 
 
 def decide(risk_score: int, provenance_flag: ProvenanceFlag) -> Decision:

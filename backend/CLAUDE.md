@@ -35,7 +35,8 @@ This repo contains the **backend only**. A separate Streamlit frontend (built by
   drift_engine.py  # Intent Drift Engine
   provenance.py    # Provenance Tracer (NetworkX graph)
   gate.py          # Secure Execution Gate (decision logic)
-  storage.py       # SQLite persistence for traces, detection outputs, and approval decisions
+  guard.py         # /guard/* live guard API router (GUARD_MODE=mock skeleton; mounted in main.py)
+  storage.py       # SQLite persistence for traces, detection outputs, approval decisions, and live guard sessions
   config.py        # Thresholds, model names, timing/timeout values, API key loading — ALL tunable values live here, nowhere else
 generate_traces.py # Generates the synthetic test-data/traces/*.json fixtures used by run_validation.py
 run_validation.py  # Validates /analyze-trace against test-data/traces and test-data/agentdojo_subset (see test-data/validation_results.md)
@@ -46,6 +47,9 @@ tests/
   test_provenance.py
   test_gate.py
   test_main.py
+  test_config.py
+  test_guard.py
+  test_known_bugs.py
 ```
 
 ## The Shared Data Contract — DO NOT CHANGE WITHOUT ASKING
@@ -154,8 +158,10 @@ Rejections (standard FastAPI error shape, `{"detail": "..."}`), confirmed live:
 - **agent.py**: Runs a multi-step tool-calling loop using `gemini-3.1-flash-lite` (Gemini function calling). Takes `original_goal`, lets the model call tools from `tools.py`, records each step in the trace format above. Stops after the model signals completion or after 6 steps. Also records a `tool_output_received` step whenever `read_email` returns content, so the content itself (not just the fact that the tool was called) is captured for `drift_engine` to see. A declared tool called with bad arguments (missing/extra — a `TypeError`) is caught the same way as a hallucinated tool name: recorded as its own step and answered with an error `function_response`, instead of crashing `/run-agent` (fixed 2026-10-19, BUG-03). When a single model turn returns several function calls, all of their `function_response`s are now collected and sent back in ONE `user` `Content`, not one `Content` per call — Gemini expects a turn's function responses together and can reject or misbehave on the next request otherwise (fixed 2026-10-19, BUG-08).
 - **drift_engine.py**: Embeds `original_goal` and each step's action description (or, for `tool_output_received` steps, the actual returned content — see `_text_to_embed_for_drift`) using `gemini-embedding-2`, computes cosine similarity, converts to `drift_score` (low similarity = high drift). Also calls `gemini-3.1-flash-lite` (`JUDGE_MODEL`) to classify whether the input looks like an injected instruction. Combines both into `risk_score` (0-100). `INJECTION_CLASSIFIER_PROMPT`'s fourth few-shot example (a benign request that mentions a sensitive-sounding topic like a security code, with no imperative/redirect structure) exists specifically to stop the judge from keying off vocabulary instead of structure — removing it reintroduces a confirmed false-positive bug (a legitimate "check my security code" request was scored 0.85 confidence of being an injected instruction before this example was added). Do not simplify this prompt back down to three examples. The actual text being judged (attacker-controllable — e.g. an email body) is wrapped in a boundary tag with a random suffix generated fresh per call (`secrets.token_hex`, in `_classify_injection`), not a fixed `"""` delimiter — a fixed delimiter let an attacker pre-write their own closing delimiter plus a fake `Score: 0.01` line into the text to escape the untrusted block and dictate their own score (fixed 2026-10-19, BUG-07). The prompt tells the judge everything inside the tag is data, never instructions, and any literal occurrence of that exact tag already inside the input text is stripped before wrapping so it can't prematurely close the block either.
 - **provenance.py**: Builds a directed graph (NetworkX) of steps, tagging each with `internal`/`external`. When `actor` changes between steps (an agent handoff) and external content exists anywhere upstream, the receiving agent is tainted — and taint now flows forward through every later step that same actor takes (tracked per-actor in one forward pass over the trace), not just the first step right after the handoff, until a fresh, directly user-sourced input (`input_source == "user"`) for that actor resets it (fixed 2026-10-19, BUG-02). A handoff with no external content anywhere upstream still correctly stays `internal` — taint only flows from actual external content, not from the mere fact of a handoff. Exposes `get_provenance_flag(trace, step_id)`.
-- **gate.py**: Pure decision logic. `decide(risk_score, provenance_flag)` — thresholds live in `config.py`, not hardcoded here. Starting thresholds: `risk_score > 80` → `block`; `40 <= risk_score <= 80` → `approval_required`; else `allow_logged`. If `provenance_flag == "tainted"`, floor the decision at `approval_required` regardless of score.
+- **gate.py**: Pure decision logic. `decide(risk_score, provenance_flag)` — thresholds live in `config.py`, not hardcoded here. Starting thresholds: `risk_score > 80` → `block`; `40 <= risk_score <= 80` → `approval_required`; else `allow_logged`. If `provenance_flag == "tainted"`, floor the decision at `approval_required` regardless of score. Also exposes `classification_for(risk_score)` (moved here from `main.py` so `/guard/*` can share it without a circular import) — maps a risk score to `"malicious"`/`"suspicious"`/`"clean"` using the same thresholds as `decide`, so the label always agrees with the decision shown alongside it.
+- **guard.py**: The `/guard/*` live guard API router (mounted in `main.py`), see the API section below for the full contract.
 - **config.py**: The only place thresholds, model names, and other tunable constants should live. When tuning during testing, edit here.
+- **storage.py**: SQLite persistence for traces, detection outputs, approval decisions, and (as of `/guard/*`) live sessions — a session is just a trace (`trace_id` == `session_id`) that grows one step at a time. `save_trace` (full replace, for `/analyze-trace` re-analysis) and `append_step` (adds one step without touching any existing steps/detections/approvals, for a live `/guard/*` session) are deliberately different functions with different atomicity guarantees — don't use one where the other is needed. `get_trace_with_detections` and `list_sessions` back `GET /trace/{trace_id}` + `GET /guard/session/{id}`, and `GET /guard/sessions`, respectively.
 
 ## API
 
@@ -165,6 +171,32 @@ Rejections (standard FastAPI error shape, `{"detail": "..."}`), confirmed live:
 - `POST /approval-decision` — accepts a human operator's approve/deny decision for a specific `(trace_id, step_id)` that was flagged `approval_required` by a prior `/analyze-trace` call (see schema above). Rejects with 404 if that step was never analyzed, 409 if it wasn't flagged `approval_required`, and 409 if it was already decided (states who decided it, what they decided, and when — fixed 2026-09-08; previously a second call silently overwrote the first). `storage.save_approval_decision` now does a plain `INSERT` (not `INSERT OR REPLACE`) against the `(trace_id, step_id)` primary key, so two near-simultaneous requests that both pass the "already decided?" pre-check can't both write: the loser gets a `sqlite3.IntegrityError`, which the endpoint turns into the same 409 instead of letting it silently overwrite the winner (fixed 2026-10-19, BUG-12).
 - `POST /run-agent` — runs the mock agent loop for a given `original_goal` and returns the resulting `Trace`. If `trace_id` is omitted (or `null`), a fresh unique id is generated (`"run_" + 8 hex chars`, e.g. `"run_a1b2c3d4"`) instead of falling back to a fixed default — two runs without an explicit `trace_id` never collide on the same trace (fixed 2026-10-19, BUG-01).
 - CORS is enabled for any `http://localhost:<port>` or `http://127.0.0.1:<port>` origin, so the Streamlit frontend can call this API from a different port.
+
+### `/guard/*` — live guard API (added 2026-10-19, Prompt 1.3; owner: P1)
+
+The frozen contract from `docs/plan/00_OVERVIEW.md` section A, as a working skeleton. A "session" is stored as an ordinary trace — `trace_id` IS `session_id` — that grows one step at a time via `storage.append_step` (never `storage.save_trace`, which would wipe earlier steps/detections/approvals; see `storage.py` above). `DetectionOutput` here is the exact same schema as `/analyze-trace`'s (see "The Shared Data Contract" above) — nothing new was added to it.
+
+**Mode gate:** every `/guard/*` route calls `guard._require_mock_mode()` first, which reads `GUARD_MODE` fresh from the environment on every request (not cached at import time like the rest of `config.py`, so it behaves like a live feature flag):
+- `GUARD_MODE=mock` → the deterministic scoring below, no LLM calls.
+- Anything else (including unset) → `501 {"detail": "..."}`. The real implementation (`GUARD_MODE` unset or `"live"`, using the actual drift_engine + provenance + gate pipeline) lands Day 3 (Prompt 3.1) — this skeleton exists so P2 (the Protected Assistant) can integrate against the real contract today without waiting on that.
+
+**Mock-mode scoring** (`guard._mock_score`), in priority order:
+1. The step's `action` is `delete_file` or `send_message` AND any earlier step in this session had `input_provenance == "external"` → `risk_score=85`, `decision="block"`.
+2. Else the step's `input_text` contains (case-insensitively) `"ignore previous"`, `"urgent"`, `"administrator"`, `"forward"`, or `"delete all"` → `risk_score=60`, `decision="approval_required"`.
+3. Else → `risk_score=15`, `decision="allow_logged"`.
+
+`drift_score` is always `0.0` in mock mode (no real drift signal is computed); `provenance_flag` and `classification` are still computed for real via `provenance.get_provenance_flag` and `gate.classification_for` (neither makes an LLM call, so there's no reason to mock them).
+
+| Method & path | Body | Returns |
+|---|---|---|
+| `POST /guard/session` | `{agent_id, original_goal}` | `{session_id}` — a fresh `"session_" + 8 hex chars` id |
+| `POST /guard/observe` | `{session_id, actor, input_text, input_source, input_provenance}` | `DetectionOutput` — content arriving (an email, a web page, a handoff); recorded with a fixed `action="observe"` |
+| `POST /guard/check` | `{session_id, actor, input_text, input_source, input_provenance, action, action_params}` | `DetectionOutput` + `approval_status: "not_required" \| "pending"` (`"pending"` only when `decision == "approval_required"`). Call **before** running the tool. |
+| `GET /guard/approval/{session_id}/{step_id}` | — | `{status: "pending" \| "approved" \| "denied", decided_by, decided_at}` — reads the same `approval_decisions` table `POST /approval-decision` writes to |
+| `GET /guard/session/{session_id}` | — | `{trace, detections}`, identical shape to `GET /trace/{trace_id}` (both now backed by `storage.get_trace_with_detections`) |
+| `GET /guard/sessions?limit=20` | — | `[{session_id, agent_id, original_goal, created_at, step_count, max_risk, worst_decision}]`, newest first. `max_risk`/`worst_decision` are `null` for a session with no `/guard/observe`/`/guard/check` calls yet. |
+
+`/guard/observe` and `/guard/check` 404 if `session_id` was never created via `POST /guard/session`. `X-PromptGuard-Key` enforcement (per the contract table in `00_OVERVIEW.md`) is NOT implemented yet — that's Day 4 (Prompt 4.1, fixes BUG-06); every `/guard/*` route is unauthenticated for now.
 
 ## Coding Conventions
 

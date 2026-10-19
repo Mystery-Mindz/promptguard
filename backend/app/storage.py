@@ -4,7 +4,7 @@ from contextlib import contextmanager
 from datetime import UTC, datetime
 
 from app import config
-from app.schemas import DetectionOutput, Trace, TraceStep
+from app.schemas import DetectionOutput, Trace, TraceStep, TraceWithDetections
 
 
 @contextmanager
@@ -81,10 +81,22 @@ def init_db() -> None:
             CREATE TABLE IF NOT EXISTS traces (
                 trace_id TEXT PRIMARY KEY,
                 agent_id TEXT NOT NULL,
-                original_goal TEXT NOT NULL
+                original_goal TEXT NOT NULL,
+                created_at TEXT
             )
             """
         )
+        # Migration for DBs created before created_at existed on `traces`
+        # (needed for GET /guard/sessions to order/display sessions by
+        # creation time) — same backfill pattern as detection_outputs above.
+        trace_columns = {row[1] for row in conn.execute("PRAGMA table_info(traces)").fetchall()}
+        if "created_at" not in trace_columns:
+            conn.execute("ALTER TABLE traces ADD COLUMN created_at TEXT")
+        conn.execute(
+            "UPDATE traces SET created_at = ? WHERE created_at IS NULL",
+            (datetime.now(UTC).isoformat(),),
+        )
+
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS trace_steps (
@@ -120,6 +132,40 @@ def _delete_trace_rows(conn: sqlite3.Connection, trace_id: str) -> None:
     conn.execute("DELETE FROM approval_decisions WHERE trace_id = ?", (trace_id,))
 
 
+def _insert_step_row(conn: sqlite3.Connection, trace_id: str, step: TraceStep) -> None:
+    """Inserts one step's row into `trace_steps`, using the caller's
+    already-open connection so it shares the caller's transaction. Shared
+    by `save_trace` (which deletes all of a trace_id's old steps first)
+    and `append_step` (which adds one step to a trace that already has
+    others), so this SQL only lives in one place.
+
+    Parameters:
+    - `conn`: an open connection.
+    - `trace_id`: which trace this step belongs to.
+    - `step`: the step to insert.
+
+    Returns nothing.
+    """
+    conn.execute(
+        """
+        INSERT INTO trace_steps
+            (trace_id, step_id, actor, input_text, input_source, input_provenance, action, action_params, timestamp)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            trace_id,
+            step.step_id,
+            step.actor,
+            step.input_text,
+            step.input_source,
+            step.input_provenance,
+            step.action,
+            json.dumps(step.action_params),
+            step.timestamp.isoformat(),
+        ),
+    )
+
+
 def save_trace(trace: Trace) -> None:
     """Saves a full trace — its `agent_id`, `original_goal`, and every
     step's complete data — into the `traces` and `trace_steps` tables.
@@ -137,34 +183,25 @@ def save_trace(trace: Trace) -> None:
     transaction as writing the new steps — so a stale step from the old
     run can never survive alongside a step from the new one, and a new,
     unrelated step can never silently inherit an old step's approval
-    decision (both were confirmed bugs: BUG-01).
+    decision (both were confirmed bugs: BUG-01). The trace's original
+    `created_at` is preserved across re-analysis (only set the first time
+    a given `trace_id` is seen).
     """
     with _connect() as conn:
         _delete_trace_rows(conn, trace.trace_id)
 
         conn.execute(
-            "INSERT OR REPLACE INTO traces (trace_id, agent_id, original_goal) VALUES (?, ?, ?)",
-            (trace.trace_id, trace.agent_id, trace.original_goal),
+            """
+            INSERT INTO traces (trace_id, agent_id, original_goal, created_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(trace_id) DO UPDATE SET
+                agent_id = excluded.agent_id,
+                original_goal = excluded.original_goal
+            """,
+            (trace.trace_id, trace.agent_id, trace.original_goal, datetime.now(UTC).isoformat()),
         )
         for step in trace.steps:
-            conn.execute(
-                """
-                INSERT INTO trace_steps
-                    (trace_id, step_id, actor, input_text, input_source, input_provenance, action, action_params, timestamp)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    trace.trace_id,
-                    step.step_id,
-                    step.actor,
-                    step.input_text,
-                    step.input_source,
-                    step.input_provenance,
-                    step.action,
-                    json.dumps(step.action_params),
-                    step.timestamp.isoformat(),
-                ),
-            )
+            _insert_step_row(conn, trace.trace_id, step)
 
 
 def get_trace(trace_id: str) -> Trace | None:
@@ -212,6 +249,103 @@ def get_trace(trace_id: str) -> Trace | None:
         original_goal=trace_row["original_goal"],
         steps=steps,
     )
+
+
+def get_trace_with_detections(trace_id: str) -> TraceWithDetections | None:
+    """Looks up a trace together with every stored detection result for
+    it — the shape both `GET /trace/{trace_id}` and `GET
+    /guard/session/{session_id}` return, factored out here so that logic
+    only lives in one place.
+
+    Parameters:
+    - `trace_id`: the trace (or guard session, same tables — `trace_id`
+      doubles as `session_id`) to look up.
+
+    Returns a `TraceWithDetections`, or `None` if `trace_id` was never
+    saved via `save_trace` or `append_step`.
+    """
+    trace = get_trace(trace_id)
+    if trace is None:
+        return None
+    detections = [DetectionOutput(**row) for row in get_detection_outputs_for_trace(trace_id)]
+    return TraceWithDetections(trace=trace, detections=detections)
+
+
+def append_step(trace_id: str, agent_id: str, original_goal: str, step: TraceStep) -> None:
+    """Appends one step to a trace, creating its `traces` row first if it
+    doesn't exist yet (e.g. this is the very first step of a new `/guard/*`
+    session). Unlike `save_trace`, this does NOT delete any of the trace's
+    existing steps, detection outputs, or approval decisions — it's for
+    incrementally growing a *live* session across multiple
+    `/guard/observe` and `/guard/check` calls, where every earlier step's
+    detection and approval must survive every later one (`save_trace`'s
+    full-replace semantics are built for `/analyze-trace` re-analysis,
+    where that's exactly what should happen instead — see BUG-01).
+
+    Parameters:
+    - `trace_id`: the session this step belongs to (`trace_id` ==
+      `session_id` for `/guard/*`).
+    - `agent_id`, `original_goal`: only written if the `traces` row for
+      `trace_id` doesn't exist yet; an existing row's values (and its
+      original `created_at`) are left untouched.
+    - `step`: the new step to append.
+
+    Returns nothing.
+    """
+    with _connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO traces (trace_id, agent_id, original_goal, created_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(trace_id) DO NOTHING
+            """,
+            (trace_id, agent_id, original_goal, datetime.now(UTC).isoformat()),
+        )
+        _insert_step_row(conn, trace_id, step)
+
+
+def list_sessions(limit: int = 20) -> list[dict]:
+    """Lists guard sessions (traces) newest-first, each summarized for
+    `GET /guard/sessions`.
+
+    Parameters:
+    - `limit`: maximum number of sessions to return.
+
+    Returns a list of dicts, each with `trace_id`, `agent_id`,
+    `original_goal`, `created_at`, `step_count` (from `trace_steps`),
+    `max_risk` (highest `risk_score` across this session's detections, or
+    `None` if nothing has been scored yet), and `worst_decision` (the most
+    severe `decision` recorded — `block` > `approval_required` >
+    `allow_logged` — or `None` if nothing has been scored yet).
+    """
+    with _connect() as conn:
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute(
+            """
+            SELECT
+                t.trace_id,
+                t.agent_id,
+                t.original_goal,
+                t.created_at,
+                (SELECT COUNT(*) FROM trace_steps ts WHERE ts.trace_id = t.trace_id) AS step_count,
+                (SELECT MAX(d.risk_score) FROM detection_outputs d WHERE d.trace_id = t.trace_id) AS max_risk,
+                (
+                    SELECT d2.decision FROM detection_outputs d2 WHERE d2.trace_id = t.trace_id
+                    ORDER BY CASE d2.decision
+                        WHEN 'block' THEN 3
+                        WHEN 'approval_required' THEN 2
+                        WHEN 'allow_logged' THEN 1
+                        ELSE 0
+                    END DESC
+                    LIMIT 1
+                ) AS worst_decision
+            FROM traces t
+            ORDER BY t.created_at DESC
+            LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+    return [dict(row) for row in rows]
 
 
 def delete_trace(trace_id: str) -> None:
