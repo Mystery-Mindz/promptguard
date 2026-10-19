@@ -100,6 +100,8 @@ When Gemini returns several function calls in one turn, `agent.py` appends **one
 ### BUG-13 · MEDIUM · Bare `pytest` can't find the `app` package (found by the local run, 19 Oct)
 Only `python -m pytest` works; plain `pytest` fails every module with `ModuleNotFoundError: No module named 'app'`. CI happens to work, but teammates will hit this. **Fix:** add `[tool.pytest.ini_options]` with `pythonpath = ["."]` and `testpaths = ["tests"]` to `backend/pyproject.toml`.
 
+**Fixed (2026-10-19):** `backend/pyproject.toml` now has `[tool.pytest.ini_options]` with `pythonpath = ["."]` and `testpaths = ["tests"]`, so plain `pytest` (run from `backend/`) puts `backend/` on `sys.path` and finds `tests/` without needing `python -m pytest` or any other workaround.
+
 ### BUG-14 · MEDIUM · An empty `GEMINI_API_KEY` in the shell silently overrides `.env` (found by the local run, 19 Oct)
 `config.py` calls `load_dotenv()` without `override=True`. If the shell has `GEMINI_API_KEY` exported, even as an empty string, the real key in `.env` is ignored and every model call fails confusingly. **Fix:** treat an empty env value as unset (e.g. `os.getenv("GEMINI_API_KEY") or dotenv_values().get("GEMINI_API_KEY")`), and fail fast at startup with a clear message if no key is found. Don't blindly use `override=True`: on Render, the platform env var must win over any stray `.env`.
 
