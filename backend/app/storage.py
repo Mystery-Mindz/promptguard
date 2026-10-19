@@ -103,21 +103,45 @@ def init_db() -> None:
         )
 
 
+def _delete_trace_rows(conn: sqlite3.Connection, trace_id: str) -> None:
+    """Deletes every row derived from a trace_id across `trace_steps`,
+    `detection_outputs`, and `approval_decisions` (but not the `traces` row
+    itself), using the caller's already-open connection so the deletes
+    share the caller's transaction.
+
+    Parameters:
+    - `conn`: an open connection (inside a `with _connect() as conn:` block).
+    - `trace_id`: the trace whose derived rows should be deleted.
+
+    Returns nothing.
+    """
+    conn.execute("DELETE FROM trace_steps WHERE trace_id = ?", (trace_id,))
+    conn.execute("DELETE FROM detection_outputs WHERE trace_id = ?", (trace_id,))
+    conn.execute("DELETE FROM approval_decisions WHERE trace_id = ?", (trace_id,))
+
+
 def save_trace(trace: Trace) -> None:
-    """Saves (or overwrites) a full trace — its `agent_id`, `original_goal`,
-    and every step's complete data — into the `traces` and `trace_steps`
-    tables. This is separate from `save_detection_output`, which only
-    stores the computed risk assessment; this function preserves the
-    original trace content itself, which is what `GET /trace/{trace_id}`
-    (via `get_trace`) reads back.
+    """Saves a full trace — its `agent_id`, `original_goal`, and every
+    step's complete data — into the `traces` and `trace_steps` tables.
+    This is separate from `save_detection_output`, which only stores the
+    computed risk assessment; this function preserves the original trace
+    content itself, which is what `GET /trace/{trace_id}` (via
+    `get_trace`) reads back.
 
     Parameters:
     - `trace`: the trace to save.
 
-    Returns nothing. If a trace with the same `trace_id` already exists,
-    it (and its steps) are replaced with this version.
+    Returns nothing. If a trace with the same `trace_id` already exists
+    (re-analysis of a previously-seen trace_id), its old steps, detection
+    outputs, AND approval decisions are all deleted first, in the same
+    transaction as writing the new steps — so a stale step from the old
+    run can never survive alongside a step from the new one, and a new,
+    unrelated step can never silently inherit an old step's approval
+    decision (both were confirmed bugs: BUG-01).
     """
     with _connect() as conn:
+        _delete_trace_rows(conn, trace.trace_id)
+
         conn.execute(
             "INSERT OR REPLACE INTO traces (trace_id, agent_id, original_goal) VALUES (?, ?, ?)",
             (trace.trace_id, trace.agent_id, trace.original_goal),
@@ -125,7 +149,7 @@ def save_trace(trace: Trace) -> None:
         for step in trace.steps:
             conn.execute(
                 """
-                INSERT OR REPLACE INTO trace_steps
+                INSERT INTO trace_steps
                     (trace_id, step_id, actor, input_text, input_source, input_provenance, action, action_params, timestamp)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
@@ -188,6 +212,24 @@ def get_trace(trace_id: str) -> Trace | None:
         original_goal=trace_row["original_goal"],
         steps=steps,
     )
+
+
+def delete_trace(trace_id: str) -> None:
+    """Deletes a trace and everything derived from it — its steps,
+    detection outputs, and approval decisions — in one transaction. Used
+    by `POST /analyze-trace` when a model/provider error interrupts
+    analysis partway through, so a trace with some steps scored and others
+    missing never persists (BUG-04); the caller should retry
+    `/analyze-trace` from scratch once the underlying error clears.
+
+    Parameters:
+    - `trace_id`: the trace to delete entirely.
+
+    Returns nothing. Safe to call even if `trace_id` was never saved.
+    """
+    with _connect() as conn:
+        _delete_trace_rows(conn, trace_id)
+        conn.execute("DELETE FROM traces WHERE trace_id = ?", (trace_id,))
 
 
 def get_detection_outputs_for_trace(trace_id: str) -> list[dict]:
@@ -332,15 +374,21 @@ def save_approval_decision(
       or `"denied_and_blocked"`.
     - `timestamp`: when the decision was made (ISO-8601 string).
 
-    Returns nothing. If a decision already exists for this
-    `(trace_id, step_id)`, it is replaced — callers are expected to check
-    `get_approval_decision` first if a decision should be immutable (as
-    `POST /approval-decision` does).
+    Returns nothing. Raises `sqlite3.IntegrityError` if a decision already
+    exists for this `(trace_id, step_id)` — a plain `INSERT` against the
+    `(trace_id, step_id)` primary key, not `INSERT OR REPLACE`, so that two
+    near-simultaneous calls for the same step can't both "pass" an earlier
+    `get_approval_decision` check and have the second silently overwrite
+    the first (BUG-12): only one commits, and the other gets a real
+    constraint violation to react to. `POST /approval-decision` checks
+    `get_approval_decision` first for the common case (a fast, clean 409
+    without even trying to write), and catches this exception as the
+    fallback for the race the pre-check can't fully close.
     """
     with _connect() as conn:
         conn.execute(
             """
-            INSERT OR REPLACE INTO approval_decisions
+            INSERT INTO approval_decisions
                 (trace_id, step_id, operator_decision, operator_id, final_status, timestamp)
             VALUES (?, ?, ?, ?, ?, ?)
             """,

@@ -1,4 +1,6 @@
 import os
+import secrets
+import sqlite3
 from datetime import UTC, datetime
 
 from fastapi import FastAPI, HTTPException
@@ -56,6 +58,18 @@ def health_endpoint() -> dict[str, str]:
     return {"status": "ok"}
 
 
+def _generate_trace_id() -> str:
+    """Generates a fresh, collision-resistant trace_id for a `/run-agent`
+    call that didn't supply its own, so two runs without an explicit
+    `trace_id` never collide and silently share (and overwrite) each
+    other's steps, detections, and approval decisions.
+
+    Takes no parameters. Returns a string like `"run_a1b2c3d4"` — the
+    `"run_"` prefix plus 8 hex characters (4 random bytes).
+    """
+    return f"run_{secrets.token_hex(4)}"
+
+
 @app.post("/run-agent", response_model=Trace)
 def run_agent_endpoint(request: RunAgentRequest) -> Trace:
     """API endpoint: `POST /run-agent`. Runs the simulated AI agent
@@ -65,12 +79,15 @@ def run_agent_endpoint(request: RunAgentRequest) -> Trace:
 
     Parameters (from the request body, see `RunAgentRequest`):
     - `original_goal`: the task to give the agent.
-    - `trace_id`: identifier for the resulting trace (has a default).
+    - `trace_id`: identifier for the resulting trace. If omitted (or
+      `null`), a fresh unique id is generated (see `_generate_trace_id`) so
+      concurrent/repeated runs never collide on the same trace_id.
     - `agent_id`: which agent is acting (has a default).
 
     Returns the resulting `Trace`.
     """
-    return run_agent(request.original_goal, request.trace_id, request.agent_id)
+    trace_id = request.trace_id or _generate_trace_id()
+    return run_agent(request.original_goal, trace_id, request.agent_id)
 
 
 def _classification_for(risk_score: int) -> Classification:
@@ -129,12 +146,27 @@ def analyze_trace(trace: Trace) -> list[DetectionOutput]:
     side effect, persists the trace (so it can be looked up later via
     `GET /trace/{trace_id}`) and each detection result (so
     `GET /pending-approvals` and `POST /approval-decision` can see it).
+
+    If the drift engine's underlying Gemini call fails partway through
+    (e.g. a 429/503 from the model provider), responds with 503 and a
+    readable `detail` message instead of a bare 500 — and deletes the
+    trace entirely rather than leaving some steps scored and others
+    missing; retry `/analyze-trace` from scratch once the error clears.
     """
     storage.save_trace(trace)
     outputs: list[DetectionOutput] = []
 
     for step in trace.steps:
-        drift_score, risk_score = compute_drift_and_risk(trace, step.step_id)
+        try:
+            drift_score, risk_score = compute_drift_and_risk(trace, step.step_id)
+        except Exception as e:
+            storage.delete_trace(trace.trace_id)
+            raise HTTPException(
+                status_code=503,
+                detail=f"Detection model is currently unavailable, analyzing trace_id={trace.trace_id!r} "
+                f"step {step.step_id} failed: {e}",
+            ) from e
+
         provenance_flag = get_provenance_flag(trace, step.step_id)
         decision = decide(risk_score, provenance_flag)
 
@@ -201,6 +233,29 @@ def pending_approvals_endpoint() -> list[PendingApproval]:
     ]
 
 
+def _already_decided_error(trace_id: str, step_id: int, existing_decision: dict) -> HTTPException:
+    """Builds the 409 raised when a `(trace_id, step_id)` already has a
+    recorded operator decision — shared by the normal pre-check in
+    `approval_decision_endpoint` and by its `sqlite3.IntegrityError`
+    fallback for the near-simultaneous-request race (BUG-12), so both
+    paths report the exact same thing to the caller.
+
+    Parameters:
+    - `trace_id`, `step_id`: identify the step.
+    - `existing_decision`: the stored decision dict (see
+      `storage.get_approval_decision`) to quote in the error message.
+
+    Returns an `HTTPException` (status 409) ready to be raised.
+    """
+    return HTTPException(
+        status_code=409,
+        detail=f"trace_id={trace_id!r}, step_id={step_id} was already "
+        f"{existing_decision['operator_decision']!r} by operator_id="
+        f"{existing_decision['operator_id']!r} at {existing_decision['timestamp']}; "
+        "a decision cannot be changed once made.",
+    )
+
+
 @app.post("/approval-decision", response_model=ApprovalDecisionResponse)
 def approval_decision_endpoint(request: ApprovalDecisionRequest) -> ApprovalDecisionResponse:
     """API endpoint: `POST /approval-decision`. Records a human operator's
@@ -238,25 +293,30 @@ def approval_decision_endpoint(request: ApprovalDecisionRequest) -> ApprovalDeci
 
     existing_decision = storage.get_approval_decision(request.trace_id, request.step_id)
     if existing_decision is not None:
-        raise HTTPException(
-            status_code=409,
-            detail=f"trace_id={request.trace_id!r}, step_id={request.step_id} was already "
-            f"{existing_decision['operator_decision']!r} by operator_id="
-            f"{existing_decision['operator_id']!r} at {existing_decision['timestamp']}; "
-            "a decision cannot be changed once made.",
-        )
+        raise _already_decided_error(request.trace_id, request.step_id, existing_decision)
 
     final_status: FinalStatus = "approved_and_allowed" if request.operator_decision == "approved" else "denied_and_blocked"
     timestamp = datetime.now(UTC)
 
-    storage.save_approval_decision(
-        trace_id=request.trace_id,
-        step_id=request.step_id,
-        operator_decision=request.operator_decision,
-        operator_id=request.operator_id,
-        final_status=final_status,
-        timestamp=timestamp.isoformat(),
-    )
+    try:
+        storage.save_approval_decision(
+            trace_id=request.trace_id,
+            step_id=request.step_id,
+            operator_decision=request.operator_decision,
+            operator_id=request.operator_id,
+            final_status=final_status,
+            timestamp=timestamp.isoformat(),
+        )
+    except sqlite3.IntegrityError:
+        # A second, near-simultaneous request for this same (trace_id,
+        # step_id) raced past the check above before this one committed its
+        # INSERT. The unique (trace_id, step_id) primary key on
+        # approval_decisions turns that race into a real constraint
+        # violation instead of silently overwriting the winner (BUG-12) —
+        # treat it exactly like the already-decided case above.
+        winning_decision = storage.get_approval_decision(request.trace_id, request.step_id)
+        assert winning_decision is not None, "IntegrityError implies a row now exists"
+        raise _already_decided_error(request.trace_id, request.step_id, winning_decision) from None
 
     return ApprovalDecisionResponse(
         trace_id=request.trace_id,

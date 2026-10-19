@@ -40,34 +40,65 @@ def get_provenance_flag(trace: Trace, step_id: int) -> ProvenanceFlag:
     - `"external"` — the step's own `input_provenance` is already marked
       external (e.g. it came from an email or other untrusted source).
     - `"tainted"` — the step's `input_provenance` claims "internal", but
-      it's the receiving end of an agent-to-agent handoff (its `actor`
-      differs from the step(s) before it), and some earlier step upstream
-      in the trace ever carried external content. This is the cross-agent
-      poisoning case: a compromised agent can't launder external content
-      into a handoff that looks trustworthy to another agent — the
-      receiving step gets flagged anyway.
-    - `"internal"` — genuinely trusted: declared internal, and either not a
-      handoff or no external content anywhere upstream.
+      the step's actor received external content via an agent-to-agent
+      handoff — either this step IS that handoff (its `actor` differs from
+      the step(s) before it, and external content exists upstream), or the
+      actor was tainted by an earlier handoff and hasn't had its taint
+      reset since. This is the cross-agent poisoning case: a compromised
+      agent can't launder external content into a handoff that looks
+      trustworthy to another agent, and that agent's actions on the back
+      of it keep getting flagged for as long as it keeps acting on that
+      laundered content — not just on the first step after the handoff.
+    - `"internal"` — genuinely trusted: declared internal, and this actor
+      has never been tainted (no handoff from external-carrying upstream),
+      or a fresh, directly user-sourced input (`input_source == "user"`)
+      has since reset this actor's taint.
+
+    Taint is tracked per-actor across the whole trace in one forward pass
+    (steps are processed in their existing order) rather than only looking
+    one step back, so it correctly spans every later step the receiving
+    agent takes, not just the first one right after the handoff.
     """
     graph = _build_graph(trace)
     steps_by_id = {step.step_id: step for step in trace.steps}
-    step = steps_by_id[step_id]
 
-    if step.input_provenance == "external":
-        return "external"
+    tainted_actors: set[str] = set()
+    seen_external = False
+    flags: dict[int, ProvenanceFlag] = {}
 
-    # step.input_provenance == "internal": this step looks trusted on its
-    # face. Check whether it's the receiving end of an agent-to-agent
-    # handoff — if so, and any upstream step ever carried external content,
-    # this node inherits that taint even though it claims to be internal.
-    predecessors = list(graph.predecessors(step_id))
-    is_handoff = bool(predecessors) and any(
-        steps_by_id[predecessor_id].actor != step.actor for predecessor_id in predecessors
-    )
+    for node_id in graph.nodes:
+        step = steps_by_id[node_id]
+        predecessors = list(graph.predecessors(node_id))
+        is_handoff = bool(predecessors) and any(
+            steps_by_id[predecessor_id].actor != step.actor for predecessor_id in predecessors
+        )
 
-    if is_handoff:
-        upstream_step_ids = nx.ancestors(graph, step_id)
-        if any(steps_by_id[upstream_id].input_provenance == "external" for upstream_id in upstream_step_ids):
-            return "tainted"
+        if step.input_provenance == "external":
+            flags[node_id] = "external"
+            seen_external = True
+            continue
 
-    return "internal"
+        if is_handoff:
+            # The receiving end of a handoff: tainted if external content
+            # exists anywhere upstream, or if this same actor was already
+            # tainted (a laundering agent handing off to itself/another
+            # tainted actor shouldn't get a clean slate).
+            if seen_external or step.actor in tainted_actors:
+                tainted_actors.add(step.actor)
+                flags[node_id] = "tainted"
+            else:
+                flags[node_id] = "internal"
+        elif step.actor in tainted_actors:
+            # Not a handoff, but this actor is still carrying taint from an
+            # earlier one. A genuinely fresh, directly user-sourced input
+            # resets it; anything else (another tool output, another
+            # handoff-adjacent step, etc.) keeps the taint flowing forward.
+            if step.input_source == "user":
+                tainted_actors.discard(step.actor)
+                flags[node_id] = "internal"
+            else:
+                flags[node_id] = "tainted"
+        else:
+            flags[node_id] = "internal"
+
+    return flags[step_id]
