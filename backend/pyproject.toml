@@ -17,3 +17,8 @@ python_version = "3.11"
 ignore_missing_imports = true
 warn_unused_ignores = true
 warn_redundant_casts = true
+
+[tool.pytest.ini_options]
+# Put backend/ on sys.path so plain `pytest` (as CI runs it) can import `app`.
+pythonpath = ["."]
+testpaths = ["tests"]
