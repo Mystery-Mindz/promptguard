@@ -54,6 +54,8 @@ python scripts/live_check.py --with-agent               # real end-to-end check 
 ### BUG-03 · MEDIUM · Bad tool arguments from the model crash `/run-agent` (500)
 `agent.py` calls `tool_fn(**args)` with no error handling. If the model omits a required argument or invents one, a `TypeError` crashes the request. This was fixed for unknown tool *names* but not for bad *arguments*. **Fix:** catch it, record the step, return an error function_response (same pattern as the hallucinated-tool fix). Test: `test_bug03_*`.
 
+**Fixed (2026-10-19):** `tool_fn(**args)` is now wrapped in `try`/`except TypeError`, recording the same kind of step (`invalid_tool_call: True`) and sending an error `function_response` back to the model, mirroring the existing hallucinated-tool-call handling immediately above it in `agent.py`. `test_bug03_*` passes now (de-xfailed).
+
 ### BUG-04 · MEDIUM · A Gemini error mid-analysis returns a bare 500 and leaves half-saved data
 `/analyze-trace` saves the trace first, then scores step by step. A 429 or quota error on step 3 gives a raw 500 with steps 1–2 saved and step 3 missing. **Fix:** catch model errors and return 503 with a clear message (e.g. `"Model quota exhausted"`), and don't persist partial results (or mark the trace `incomplete`). Test: `test_bug04_*`.
 

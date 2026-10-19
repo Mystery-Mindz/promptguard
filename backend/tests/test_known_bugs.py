@@ -160,7 +160,6 @@ def test_bug02_handoff_with_no_external_content_upstream_is_not_a_false_positive
 # --- BUG-03: bad tool arguments from the model crash /run-agent -------------
 
 
-@known_bug
 def test_bug03_run_agent_survives_tool_call_with_missing_arguments():
     bad_call = MagicMock(args={}, id="call_1")  # send_message requires `to` and `content`
     bad_call.name = "send_message"

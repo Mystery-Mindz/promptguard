@@ -236,7 +236,43 @@ def run_agent(original_goal: str, trace_id: str, agent_id: str = "agent_A") -> T
                 )
                 continue
 
-            result = tool_fn(**args)
+            try:
+                result = tool_fn(**args)
+            except TypeError as e:
+                # Gemini called a real, declared tool but with bad arguments
+                # (missing a required one, an unexpected extra one, etc.) --
+                # not a bug in the trace content itself. Same pattern as the
+                # hallucinated-tool-call case above: record it as its own
+                # step and tell the model via a normal function_response so
+                # it can recover on its own, instead of an unhandled
+                # TypeError crashing the whole /run-agent request.
+                steps.append(
+                    TraceStep(
+                        step_id=len(steps) + 1,
+                        actor=agent_id,
+                        input_text=f"Model called '{name}' with invalid arguments {args}: {e}",
+                        input_source="agent_handoff",
+                        input_provenance="internal",
+                        action=name,
+                        action_params={"invalid_tool_call": True, "requested_args": args, "error": str(e)},
+                        timestamp=_now(),
+                    )
+                )
+                contents.append(
+                    types.Content(
+                        role="user",
+                        parts=[
+                            types.Part(
+                                function_response=types.FunctionResponse(
+                                    id=call.id,
+                                    name=name,
+                                    response={"error": f"invalid arguments for tool '{name}': {e}"},
+                                )
+                            )
+                        ],
+                    )
+                )
+                continue
 
             steps.append(
                 TraceStep(
