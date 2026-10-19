@@ -10,11 +10,46 @@ was chosen.
 
 import os
 
-from dotenv import load_dotenv
+from dotenv import dotenv_values, load_dotenv
 
 load_dotenv()
 
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+
+def _resolve_gemini_api_key() -> str:
+    """Resolves `GEMINI_API_KEY`, treating an empty value the same as a
+    missing one and failing fast with a clear error if no real key can be
+    found anywhere.
+
+    `load_dotenv()` above only sets `os.environ["GEMINI_API_KEY"]` from
+    `.env` when that name isn't already present in the process environment
+    at all — if the shell has it exported as `GEMINI_API_KEY=""`, it IS
+    already present (just empty), so `load_dotenv()` leaves it empty and a
+    real key sitting in `.env` is silently ignored (BUG-14). Falling back
+    to `.env` only when the resolved env value is falsy (`None` or `""`)
+    fixes that without a blind `load_dotenv(override=True)`, which would
+    wrongly let a stray local `.env` beat a real platform-set env var in
+    deployment (e.g. on Render).
+
+    Takes no parameters. Returns the resolved key. Raises `RuntimeError`
+    if no non-empty key is found in either the process environment or
+    `.env`, so a missing key fails immediately and legibly at startup
+    instead of surfacing later as a confusing Gemini auth error.
+    """
+    env_value = os.getenv("GEMINI_API_KEY")
+    if env_value:
+        return env_value
+
+    dotenv_value = dotenv_values().get("GEMINI_API_KEY")
+    if dotenv_value:
+        return dotenv_value
+
+    raise RuntimeError(
+        "GEMINI_API_KEY is not set. Set it in backend/.env (GEMINI_API_KEY=...) "
+        "or export it in your shell/deployment platform before starting the app."
+    )
+
+
+GEMINI_API_KEY = _resolve_gemini_api_key()
 
 # Model names — the only place these should be set.
 # Confirmed against a live client.models.list() call on 2026-09-08 — see

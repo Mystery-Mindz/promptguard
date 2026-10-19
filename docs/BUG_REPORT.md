@@ -105,6 +105,8 @@ Only `python -m pytest` works; plain `pytest` fails every module with `ModuleNot
 ### BUG-14 · MEDIUM · An empty `GEMINI_API_KEY` in the shell silently overrides `.env` (found by the local run, 19 Oct)
 `config.py` calls `load_dotenv()` without `override=True`. If the shell has `GEMINI_API_KEY` exported, even as an empty string, the real key in `.env` is ignored and every model call fails confusingly. **Fix:** treat an empty env value as unset (e.g. `os.getenv("GEMINI_API_KEY") or dotenv_values().get("GEMINI_API_KEY")`), and fail fast at startup with a clear message if no key is found. Don't blindly use `override=True`: on Render, the platform env var must win over any stray `.env`.
 
+**Fixed (2026-10-19):** Added `config._resolve_gemini_api_key()`: checks `os.getenv("GEMINI_API_KEY")` first and only falls back to `dotenv_values().get("GEMINI_API_KEY")` when that's falsy (`None` or `""`), so a real platform env var always wins and `load_dotenv(override=True)` is never used (keeps Render's real env var safe from a stray local `.env`). Raises `RuntimeError` immediately if no non-empty key is found anywhere. New `tests/test_config.py` covers: empty env value falls back to `.env`, missing env value falls back to `.env`, a real non-empty env value wins over `.env`, and both empty/missing everywhere fails fast with a clear `RuntimeError`.
+
 ### Observation · Gemini 503 "high demand" (19 Oct, ~10 pm IST)
 `gemini-3.1-flash-lite` returned 503 (Google-side overload, not quota) on both `/run-agent` and `/analyze-trace`. It's transient, but it shows why the Day-2 provider layer must treat **503 the same as 429**: retry with backoff, then switch to the fallback model or provider, then return a clean 503 to the client (BUG-04).
 

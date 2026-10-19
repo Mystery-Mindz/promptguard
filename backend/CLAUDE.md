@@ -172,7 +172,7 @@ Rejections (standard FastAPI error shape, `{"detail": "..."}`), confirmed live:
 - Pydantic models for all request/response shapes — no raw dicts crossing the API boundary.
 - Keep `drift_engine.py`, `provenance.py`, and `gate.py` independently testable — no direct imports between them; `main.py` orchestrates the calls between components.
 - All Gemini calls go through a small wrapper (put it in `config.py` or a `clients.py` if it grows) so the model name is set in one place, not scattered across files.
-- Never hardcode the API key — always load from `.env` via `python-dotenv`.
+- Never hardcode the API key — always load from `.env` via `python-dotenv`. `config._resolve_gemini_api_key` treats an empty `GEMINI_API_KEY` env value the same as a missing one and falls back to `.env` in that case (an empty-but-exported shell var used to silently shadow a real key in `.env` — BUG-14), but never uses `load_dotenv(override=True)`, so a real platform-set env var (e.g. on Render) still always wins over a stray local `.env`. Fails fast with `RuntimeError` at import time if no non-empty key is found anywhere (fixed 2026-10-19).
 
 ## Build Priority Order (this is a hackathon — build in this order, not all at once)
 
