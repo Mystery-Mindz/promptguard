@@ -6,16 +6,14 @@ from datetime import UTC, datetime
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
-from app import storage
+from app import guard, storage
 from app.agent import run_agent
-from app.config import RISK_APPROVAL_HIGH_THRESHOLD, RISK_APPROVAL_LOW_THRESHOLD, RISK_BLOCK_THRESHOLD
 from app.drift_engine import compute_drift_and_risk
-from app.gate import decide
+from app.gate import classification_for, decide
 from app.provenance import get_provenance_flag
 from app.schemas import (
     ApprovalDecisionRequest,
     ApprovalDecisionResponse,
-    Classification,
     DetectionOutput,
     FinalStatus,
     PendingApproval,
@@ -44,6 +42,7 @@ app.add_middleware(
 )
 
 storage.init_db()
+app.include_router(guard.router)
 
 
 @app.get("/health")
@@ -88,24 +87,6 @@ def run_agent_endpoint(request: RunAgentRequest) -> Trace:
     """
     trace_id = request.trace_id or _generate_trace_id()
     return run_agent(request.original_goal, trace_id, request.agent_id)
-
-
-def _classification_for(risk_score: int) -> Classification:
-    """Maps a numeric risk score to a human-readable label, using the same
-    thresholds as `gate.decide` (so the label always agrees with the
-    decision it's shown alongside).
-
-    Parameters:
-    - `risk_score`: 0-100 risk score for a step.
-
-    Returns `"malicious"` (above `RISK_BLOCK_THRESHOLD`), `"suspicious"`
-    (within the approval-required band), or `"clean"` (otherwise).
-    """
-    if risk_score > RISK_BLOCK_THRESHOLD:
-        return "malicious"
-    if RISK_APPROVAL_LOW_THRESHOLD <= risk_score <= RISK_APPROVAL_HIGH_THRESHOLD:
-        return "suspicious"
-    return "clean"
 
 
 def _explanation_for(step: TraceStep, drift_score: float, risk_score: int, provenance_flag: ProvenanceFlag) -> str:
@@ -176,7 +157,7 @@ def analyze_trace(trace: Trace) -> list[DetectionOutput]:
             drift_score=drift_score,
             risk_score=risk_score,
             provenance_flag=provenance_flag,
-            classification=_classification_for(risk_score),
+            classification=classification_for(risk_score),
             explanation=_explanation_for(step, drift_score, risk_score, provenance_flag),
             decision=decision,
         )
@@ -199,15 +180,13 @@ def get_trace_endpoint(trace_id: str) -> TraceWithDetections:
     detection result. Responds with 404 if no trace with this ID was ever
     analyzed via `POST /analyze-trace`.
     """
-    trace = storage.get_trace(trace_id)
-    if trace is None:
+    result = storage.get_trace_with_detections(trace_id)
+    if result is None:
         raise HTTPException(
             status_code=404,
             detail=f"No trace found for trace_id={trace_id!r}. Run /analyze-trace on it first.",
         )
-
-    detections = [DetectionOutput(**row) for row in storage.get_detection_outputs_for_trace(trace_id)]
-    return TraceWithDetections(trace=trace, detections=detections)
+    return result
 
 
 @app.get("/pending-approvals", response_model=list[PendingApproval])
