@@ -120,7 +120,6 @@ def test_bug01_run_agent_does_not_reuse_one_fixed_trace_id():
 # --- BUG-02: taint stops after the first step of the receiving agent --------
 
 
-@known_bug
 def test_bug02_taint_persists_for_every_later_step_of_the_receiving_agent():
     trace = Trace(
         trace_id="handoff",
@@ -137,6 +136,25 @@ def test_bug02_taint_persists_for_every_later_step_of_the_receiving_agent():
     assert get_provenance_flag(trace, 3) == "tainted"
     assert get_provenance_flag(trace, 4) == "tainted", "agent B's send_message is acting on laundered content"
     assert get_provenance_flag(trace, 5) == "tainted", "agent B's delete_file is acting on laundered content"
+
+
+def test_bug02_handoff_with_no_external_content_upstream_is_not_a_false_positive():
+    """A handoff by itself is not suspicious — only a handoff downstream of
+    actual external content is. Guards against over-tainting once taint
+    flows forward (BUG-02's fix must not turn every handoff into a false
+    positive)."""
+    trace = Trace(
+        trace_id="clean_handoff",
+        agent_id="A",
+        original_goal="g",
+        steps=[
+            _step(1, "A", "internal", "read_email"),
+            _step(2, "B", "internal", "summarise", "agent_handoff"),
+            _step(3, "B", "internal", "send_message", "agent_handoff"),
+        ],
+    )
+    assert get_provenance_flag(trace, 2) == "internal"
+    assert get_provenance_flag(trace, 3) == "internal"
 
 
 # --- BUG-03: bad tool arguments from the model crash /run-agent -------------

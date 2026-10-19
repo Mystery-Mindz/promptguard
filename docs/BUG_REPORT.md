@@ -49,6 +49,8 @@ python scripts/live_check.py --with-agent               # real end-to-end check 
 
 **Fix:** taint should flow forward. Once an agent receives a handoff whose upstream contains external content, every later step by that agent is tainted until fresh trusted input (a new user message) resets it. Test: `test_bug02_*`.
 
+**Fixed (2026-10-19):** `get_provenance_flag` now does one forward pass over the trace tracking a per-actor taint set: a handoff from external-carrying upstream (or from an already-tainted actor) taints that actor, and the actor stays tainted on every subsequent step until a step with `input_source == "user"` resets it. Added `test_bug02_handoff_with_no_external_content_upstream_is_not_a_false_positive` to lock in the "a bare handoff isn't itself suspicious" boundary the secondary issue warned about. Both `test_bug02_*` pass now (de-xfailed); existing `test_provenance.py` cases still pass unchanged.
+
 ### BUG-03 · MEDIUM · Bad tool arguments from the model crash `/run-agent` (500)
 `agent.py` calls `tool_fn(**args)` with no error handling. If the model omits a required argument or invents one, a `TypeError` crashes the request. This was fixed for unknown tool *names* but not for bad *arguments*. **Fix:** catch it, record the step, return an error function_response (same pattern as the hallucinated-tool fix). Test: `test_bug03_*`.
 
