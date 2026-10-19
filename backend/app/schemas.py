@@ -3,8 +3,6 @@ from typing import Any, Literal
 
 from pydantic import BaseModel
 
-from app.config import DEFAULT_TRACE_ID
-
 InputSource = Literal["user", "tool_output", "document", "agent_handoff"]
 InputProvenance = Literal["internal", "external"]
 ProvenanceFlag = Literal["internal", "external", "tainted"]
@@ -45,7 +43,9 @@ class DetectionOutput(BaseModel):
 
 class RunAgentRequest(BaseModel):
     original_goal: str
-    trace_id: str = DEFAULT_TRACE_ID
+    # None means "generate a fresh unique trace_id" (see
+    # main._generate_trace_id) — not sent means the same as explicitly null.
+    trace_id: str | None = None
     agent_id: str = "agent_A"
 
 

@@ -104,20 +104,29 @@ def init_db() -> None:
 
 
 def save_trace(trace: Trace) -> None:
-    """Saves (or overwrites) a full trace — its `agent_id`, `original_goal`,
-    and every step's complete data — into the `traces` and `trace_steps`
-    tables. This is separate from `save_detection_output`, which only
-    stores the computed risk assessment; this function preserves the
-    original trace content itself, which is what `GET /trace/{trace_id}`
-    (via `get_trace`) reads back.
+    """Saves a full trace — its `agent_id`, `original_goal`, and every
+    step's complete data — into the `traces` and `trace_steps` tables.
+    This is separate from `save_detection_output`, which only stores the
+    computed risk assessment; this function preserves the original trace
+    content itself, which is what `GET /trace/{trace_id}` (via
+    `get_trace`) reads back.
 
     Parameters:
     - `trace`: the trace to save.
 
-    Returns nothing. If a trace with the same `trace_id` already exists,
-    it (and its steps) are replaced with this version.
+    Returns nothing. If a trace with the same `trace_id` already exists
+    (re-analysis of a previously-seen trace_id), its old steps, detection
+    outputs, AND approval decisions are all deleted first, in the same
+    transaction as writing the new steps — so a stale step from the old
+    run can never survive alongside a step from the new one, and a new,
+    unrelated step can never silently inherit an old step's approval
+    decision (both were confirmed bugs: BUG-01).
     """
     with _connect() as conn:
+        conn.execute("DELETE FROM trace_steps WHERE trace_id = ?", (trace.trace_id,))
+        conn.execute("DELETE FROM detection_outputs WHERE trace_id = ?", (trace.trace_id,))
+        conn.execute("DELETE FROM approval_decisions WHERE trace_id = ?", (trace.trace_id,))
+
         conn.execute(
             "INSERT OR REPLACE INTO traces (trace_id, agent_id, original_goal) VALUES (?, ?, ?)",
             (trace.trace_id, trace.agent_id, trace.original_goal),
@@ -125,7 +134,7 @@ def save_trace(trace: Trace) -> None:
         for step in trace.steps:
             conn.execute(
                 """
-                INSERT OR REPLACE INTO trace_steps
+                INSERT INTO trace_steps
                     (trace_id, step_id, actor, input_text, input_source, input_provenance, action, action_params, timestamp)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,

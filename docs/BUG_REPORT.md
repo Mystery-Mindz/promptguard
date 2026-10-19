@@ -42,6 +42,8 @@ python scripts/live_check.py --with-agent               # real end-to-end check 
 
 **Fix:** generate a unique trace ID per run (e.g. `run_<uuid>`). On re-analysis, delete the old steps, detections and approval decisions for that trace ID in one transaction (or refuse with 409 if any decision exists). Tests: `test_bug01_*`.
 
+**Fixed (2026-10-19):** `/run-agent` now generates `"run_" + 8 hex chars` when `trace_id` is omitted (`DEFAULT_TRACE_ID` removed — nothing else needed it). `storage.save_trace` now deletes any existing `trace_steps`, `detection_outputs`, and `approval_decisions` rows for that `trace_id` before writing the new ones, all in one transaction, so re-analysis can't leave stale steps or let a new step inherit an old approval. `test_bug01_*` all pass now (de-xfailed).
+
 ### BUG-02 · HIGH · Cross-agent taint only covers the receiving agent's FIRST step ✔ confirmed
 `provenance.get_provenance_flag` only flags `tainted` when the immediately preceding step had a different actor. Agent B's 2nd, 3rd… steps (the ones that actually `send_message` / `delete_file` on the laundered content) come back `internal` and are allowed. The headline demo only passes because its tainted step happens to be the first step after the handoff. A secondary issue: *any* handoff after *any* earlier external content is tainted, even if unrelated (a false-positive risk once real multi-agent runs exist).
 

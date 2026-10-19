@@ -45,7 +45,6 @@ def _step(step_id: int, actor: str, provenance: str, action: str, source: str = 
 # --- BUG-01: re-analysing an existing trace_id keeps stale data -------------
 
 
-@known_bug
 def test_bug01_reanalysis_replaces_old_steps():
     old = Trace(
         trace_id="t",
@@ -67,7 +66,6 @@ def test_bug01_reanalysis_replaces_old_steps():
     assert [s.action for s in stored.steps] == ["read_email", "delete_file"]
 
 
-@known_bug
 def test_bug01_new_flagged_step_does_not_inherit_an_old_approval():
     trace = {
         "trace_id": "reused_id",
@@ -104,7 +102,6 @@ def test_bug01_new_flagged_step_does_not_inherit_an_old_approval():
     )
 
 
-@known_bug
 def test_bug01_run_agent_does_not_reuse_one_fixed_trace_id():
     fake = Trace(trace_id="ignored", agent_id="agent_A", original_goal="g", steps=[])
     seen: list[str] = []

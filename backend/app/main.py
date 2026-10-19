@@ -1,4 +1,5 @@
 import os
+import secrets
 from datetime import UTC, datetime
 
 from fastapi import FastAPI, HTTPException
@@ -56,6 +57,18 @@ def health_endpoint() -> dict[str, str]:
     return {"status": "ok"}
 
 
+def _generate_trace_id() -> str:
+    """Generates a fresh, collision-resistant trace_id for a `/run-agent`
+    call that didn't supply its own, so two runs without an explicit
+    `trace_id` never collide and silently share (and overwrite) each
+    other's steps, detections, and approval decisions.
+
+    Takes no parameters. Returns a string like `"run_a1b2c3d4"` — the
+    `"run_"` prefix plus 8 hex characters (4 random bytes).
+    """
+    return f"run_{secrets.token_hex(4)}"
+
+
 @app.post("/run-agent", response_model=Trace)
 def run_agent_endpoint(request: RunAgentRequest) -> Trace:
     """API endpoint: `POST /run-agent`. Runs the simulated AI agent
@@ -65,12 +78,15 @@ def run_agent_endpoint(request: RunAgentRequest) -> Trace:
 
     Parameters (from the request body, see `RunAgentRequest`):
     - `original_goal`: the task to give the agent.
-    - `trace_id`: identifier for the resulting trace (has a default).
+    - `trace_id`: identifier for the resulting trace. If omitted (or
+      `null`), a fresh unique id is generated (see `_generate_trace_id`) so
+      concurrent/repeated runs never collide on the same trace_id.
     - `agent_id`: which agent is acting (has a default).
 
     Returns the resulting `Trace`.
     """
-    return run_agent(request.original_goal, request.trace_id, request.agent_id)
+    trace_id = request.trace_id or _generate_trace_id()
+    return run_agent(request.original_goal, trace_id, request.agent_id)
 
 
 def _classification_for(risk_score: int) -> Classification:
