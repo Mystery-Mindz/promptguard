@@ -374,15 +374,21 @@ def save_approval_decision(
       or `"denied_and_blocked"`.
     - `timestamp`: when the decision was made (ISO-8601 string).
 
-    Returns nothing. If a decision already exists for this
-    `(trace_id, step_id)`, it is replaced — callers are expected to check
-    `get_approval_decision` first if a decision should be immutable (as
-    `POST /approval-decision` does).
+    Returns nothing. Raises `sqlite3.IntegrityError` if a decision already
+    exists for this `(trace_id, step_id)` — a plain `INSERT` against the
+    `(trace_id, step_id)` primary key, not `INSERT OR REPLACE`, so that two
+    near-simultaneous calls for the same step can't both "pass" an earlier
+    `get_approval_decision` check and have the second silently overwrite
+    the first (BUG-12): only one commits, and the other gets a real
+    constraint violation to react to. `POST /approval-decision` checks
+    `get_approval_decision` first for the common case (a fast, clean 409
+    without even trying to write), and catches this exception as the
+    fallback for the race the pre-check can't fully close.
     """
     with _connect() as conn:
         conn.execute(
             """
-            INSERT OR REPLACE INTO approval_decisions
+            INSERT INTO approval_decisions
                 (trace_id, step_id, operator_decision, operator_id, final_status, timestamp)
             VALUES (?, ?, ?, ?, ?, ?)
             """,

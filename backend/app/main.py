@@ -1,5 +1,6 @@
 import os
 import secrets
+import sqlite3
 from datetime import UTC, datetime
 
 from fastapi import FastAPI, HTTPException
@@ -232,6 +233,29 @@ def pending_approvals_endpoint() -> list[PendingApproval]:
     ]
 
 
+def _already_decided_error(trace_id: str, step_id: int, existing_decision: dict) -> HTTPException:
+    """Builds the 409 raised when a `(trace_id, step_id)` already has a
+    recorded operator decision — shared by the normal pre-check in
+    `approval_decision_endpoint` and by its `sqlite3.IntegrityError`
+    fallback for the near-simultaneous-request race (BUG-12), so both
+    paths report the exact same thing to the caller.
+
+    Parameters:
+    - `trace_id`, `step_id`: identify the step.
+    - `existing_decision`: the stored decision dict (see
+      `storage.get_approval_decision`) to quote in the error message.
+
+    Returns an `HTTPException` (status 409) ready to be raised.
+    """
+    return HTTPException(
+        status_code=409,
+        detail=f"trace_id={trace_id!r}, step_id={step_id} was already "
+        f"{existing_decision['operator_decision']!r} by operator_id="
+        f"{existing_decision['operator_id']!r} at {existing_decision['timestamp']}; "
+        "a decision cannot be changed once made.",
+    )
+
+
 @app.post("/approval-decision", response_model=ApprovalDecisionResponse)
 def approval_decision_endpoint(request: ApprovalDecisionRequest) -> ApprovalDecisionResponse:
     """API endpoint: `POST /approval-decision`. Records a human operator's
@@ -269,25 +293,30 @@ def approval_decision_endpoint(request: ApprovalDecisionRequest) -> ApprovalDeci
 
     existing_decision = storage.get_approval_decision(request.trace_id, request.step_id)
     if existing_decision is not None:
-        raise HTTPException(
-            status_code=409,
-            detail=f"trace_id={request.trace_id!r}, step_id={request.step_id} was already "
-            f"{existing_decision['operator_decision']!r} by operator_id="
-            f"{existing_decision['operator_id']!r} at {existing_decision['timestamp']}; "
-            "a decision cannot be changed once made.",
-        )
+        raise _already_decided_error(request.trace_id, request.step_id, existing_decision)
 
     final_status: FinalStatus = "approved_and_allowed" if request.operator_decision == "approved" else "denied_and_blocked"
     timestamp = datetime.now(UTC)
 
-    storage.save_approval_decision(
-        trace_id=request.trace_id,
-        step_id=request.step_id,
-        operator_decision=request.operator_decision,
-        operator_id=request.operator_id,
-        final_status=final_status,
-        timestamp=timestamp.isoformat(),
-    )
+    try:
+        storage.save_approval_decision(
+            trace_id=request.trace_id,
+            step_id=request.step_id,
+            operator_decision=request.operator_decision,
+            operator_id=request.operator_id,
+            final_status=final_status,
+            timestamp=timestamp.isoformat(),
+        )
+    except sqlite3.IntegrityError:
+        # A second, near-simultaneous request for this same (trace_id,
+        # step_id) raced past the check above before this one committed its
+        # INSERT. The unique (trace_id, step_id) primary key on
+        # approval_decisions turns that race into a real constraint
+        # violation instead of silently overwriting the winner (BUG-12) —
+        # treat it exactly like the already-decided case above.
+        winning_decision = storage.get_approval_decision(request.trace_id, request.step_id)
+        assert winning_decision is not None, "IntegrityError implies a row now exists"
+        raise _already_decided_error(request.trace_id, request.step_id, winning_decision) from None
 
     return ApprovalDecisionResponse(
         trace_id=request.trace_id,

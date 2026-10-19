@@ -95,6 +95,8 @@ When Gemini returns several function calls in one turn, `agent.py` appends **one
 ### BUG-12 · LOW · Approval decision race
 `/approval-decision` checks "already decided?" and then writes with `INSERT OR REPLACE`. Two near-simultaneous clicks can both pass the check, and the second overwrites the first. Use a plain `INSERT` and turn the unique-key violation into 409.
 
+**Fixed (2026-10-19):** `storage.save_approval_decision` now does a plain `INSERT` against the `(trace_id, step_id)` primary key, so it raises `sqlite3.IntegrityError` instead of silently overwriting. `approval_decision_endpoint` catches that and raises the same 409 (`_already_decided_error`, now shared by both the normal pre-check and this race fallback) with the *winning* decision's real details. New unit test `test_bug12_concurrent_approval_decisions_do_not_silently_overwrite` simulates the TOCTOU window (mocks the pre-check to return "not decided yet" while a real conflicting decision already exists) and asserts the loser gets 409 while the winner's decision is unchanged.
+
 ### BUG-13 · MEDIUM · Bare `pytest` can't find the `app` package (found by the local run, 19 Oct)
 Only `python -m pytest` works; plain `pytest` fails every module with `ModuleNotFoundError: No module named 'app'`. CI happens to work, but teammates will hit this. **Fix:** add `[tool.pytest.ini_options]` with `pythonpath = ["."]` and `testpaths = ["tests"]` to `backend/pyproject.toml`.
 

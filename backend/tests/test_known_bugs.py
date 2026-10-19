@@ -19,7 +19,7 @@ from app import config, storage
 from app.drift_engine import _classify_injection
 from app.main import app
 from app.provenance import get_provenance_flag
-from app.schemas import Trace, TraceStep
+from app.schemas import DetectionOutput, Trace, TraceStep
 
 client = TestClient(app)
 
@@ -299,3 +299,66 @@ def test_bug08_parallel_function_calls_get_one_combined_function_response_turn()
     assert len(combined.parts) == 2
     returned_names = {part.function_response.name for part in combined.parts}
     assert returned_names == {"read_email", "send_message"}
+
+
+# --- BUG-12: approval decisions race on INSERT OR REPLACE -------------------
+
+
+def test_bug12_concurrent_approval_decisions_do_not_silently_overwrite():
+    """Simulates two near-simultaneous /approval-decision calls for the same
+    (trace_id, step_id): both pass the "already decided?" pre-check before
+    either has written (the TOCTOU window), but only one write can win --
+    the loser must get a clean 409, never silently overwrite the winner."""
+    trace_id, step_id = "race_trace", 1
+    storage.save_detection_output(
+        DetectionOutput(
+            trace_id=trace_id,
+            step_id=step_id,
+            drift_score=0.5,
+            risk_score=60,
+            provenance_flag="internal",
+            classification="suspicious",
+            explanation="e",
+            decision="approval_required",
+        )
+    )
+    # The "winning" concurrent request's write, already committed.
+    storage.save_approval_decision(
+        trace_id=trace_id,
+        step_id=step_id,
+        operator_decision="approved",
+        operator_id="first_operator",
+        final_status="approved_and_allowed",
+        timestamp="2026-10-19T10:00:00+00:00",
+    )
+
+    real_get_approval_decision = storage.get_approval_decision
+    call_count = {"n": 0}
+
+    def fake_get_approval_decision(trace_id_arg, step_id_arg):
+        call_count["n"] += 1
+        if call_count["n"] == 1:
+            # This request's own pre-check races past the winning write
+            # above before it had happened, same as it would for two
+            # genuinely-concurrent requests.
+            return None
+        return real_get_approval_decision(trace_id_arg, step_id_arg)
+
+    with patch("app.main.storage.get_approval_decision", side_effect=fake_get_approval_decision):
+        response = client.post(
+            "/approval-decision",
+            json={
+                "trace_id": trace_id,
+                "step_id": step_id,
+                "operator_decision": "denied",
+                "operator_id": "second_operator",
+            },
+        )
+
+    assert response.status_code == 409, response.text
+    assert "first_operator" in response.json()["detail"]
+
+    final = storage.get_approval_decision(trace_id, step_id)
+    assert final is not None
+    assert final["operator_decision"] == "approved"
+    assert final["operator_id"] == "first_operator", "the second, racing request must not overwrite the first"
