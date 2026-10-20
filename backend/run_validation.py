@@ -30,6 +30,40 @@ import json
 import os
 import sys
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from app.config import RISK_APPROVAL_LOW_THRESHOLD, RISK_BLOCK_THRESHOLD  # noqa: E402
+
+# How close (in risk_score points) to a gate threshold counts as "thin
+# margin" and gets a WARNING printed. LLM judge/embedding output is not
+# perfectly stable run-to-run (see validation_results.md's documented
+# score variance across runs/models), so a step that happens to pass today
+# by only a few points is a real regression risk even when the run as a
+# whole is green -- this is a watch-item flag, not a failure.
+MARGIN_WARNING_DISTANCE = 5
+_GATE_THRESHOLDS = (RISK_APPROVAL_LOW_THRESHOLD, RISK_BLOCK_THRESHOLD)
+
+
+def _margin_warnings(file_name: str, outputs: list[dict]) -> list[str]:
+    """Checks every step's risk_score against both gate thresholds
+    (RISK_APPROVAL_LOW_THRESHOLD, RISK_BLOCK_THRESHOLD) and returns one
+    warning string per step that landed within MARGIN_WARNING_DISTANCE
+    points of either one -- regardless of whether the trace as a whole
+    passed or failed, since a thin margin on a currently-passing step is
+    exactly the kind of silent regression risk this is meant to surface.
+    """
+    warnings = []
+    for output in outputs:
+        risk_score = output["risk_score"]
+        for threshold in _GATE_THRESHOLDS:
+            distance = abs(risk_score - threshold)
+            if distance <= MARGIN_WARNING_DISTANCE:
+                warnings.append(
+                    f"    WARNING: {file_name} step {output['step_id']} risk_score={risk_score} is only "
+                    f"{distance} point(s) from threshold={threshold} (decision={output['decision']!r}) "
+                    "-- thin margin, watch for regression on the next run."
+                )
+    return warnings
+
 
 def _get_client(base_url: str | None):
     if base_url:
@@ -37,7 +71,6 @@ def _get_client(base_url: str | None):
 
         return httpx.Client(base_url=base_url, timeout=30)
 
-    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     from fastapi.testclient import TestClient
 
     from app.main import app
@@ -64,6 +97,7 @@ def run_validation(test_data_dirs: list[str], base_url: str | None) -> int:
     total = 0
     passed = 0
     failures = []
+    margin_warnings = []
 
     for file_path in trace_files:
         file_name = os.path.basename(file_path)
@@ -89,6 +123,8 @@ def run_validation(test_data_dirs: list[str], base_url: str | None) -> int:
             )
             continue
 
+        margin_warnings.extend(_margin_warnings(file_name, outputs))
+
         actual_flagged_steps = {o["step_id"] for o in outputs if o["decision"] != "allow_logged"}
 
         if actual_flagged_steps == expected_flagged_steps:
@@ -108,6 +144,12 @@ def run_validation(test_data_dirs: list[str], base_url: str | None) -> int:
         )
 
     print(f"\n{passed}/{total} traces handled correctly\n")
+
+    if margin_warnings:
+        print(f"{len(margin_warnings)} thin-margin warning(s) (within {MARGIN_WARNING_DISTANCE} points of a threshold):\n")
+        for warning in margin_warnings:
+            print(warning)
+        print()
 
     if failures:
         print(f"{len(failures)} failing trace(s):\n")

@@ -92,6 +92,8 @@ When Gemini returns several function calls in one turn, `agent.py` appends **one
 - A tainted step floored to `approval_required` is still labelled classification `clean`.
 - Drift score is shown unrounded. 4 ruff issues in the frontend.
 
+**Partially fixed (2026-10-20):** `gate.classification_for` now takes the final `decision` (not `risk_score`) and maps it directly — `block→"malicious"`, `approval_required→"suspicious"`, `allow_logged→"clean"` — so it always agrees with the decision shown alongside it by construction. This also makes the first bullet's concern moot: the "block never fires" gap below is fixed, so real attacks can now reach `block` for real (see `test-data/validation_results.md`'s 2026-10-20 update). The unrounded-drift-score display and the frontend ruff issues are unaddressed — still frontend work.
+
 ### BUG-12 · LOW · Approval decision race
 `/approval-decision` checks "already decided?" and then writes with `INSERT OR REPLACE`. Two near-simultaneous clicks can both pass the check, and the second overwrites the first. Use a plain `INSERT` and turn the unique-key violation into 409.
 
@@ -111,8 +113,8 @@ Only `python -m pytest` works; plain `pytest` fails every module with `ModuleNot
 `gemini-3.1-flash-lite` returned 503 (Google-side overload, not quota) on both `/run-agent` and `/analyze-trace`. It's transient, but it shows why the Day-2 provider layer must treat **503 the same as 429**: retry with backoff, then switch to the fallback model or provider, then return a clean 503 to the client (BUG-04).
 
 ## Design gaps (not bugs, but judges will ask)
-- **"block" never fires**: attacks score 42–56 and blocking starts above 80.
-- **`trace_18` passes by 2 points**: the thinnest margin in the suite.
-- **No live protection**: analysis happens after the agent has already acted.
+- ~~**"block" never fires**: attacks score 42–56 and blocking starts above 80.~~ **Fixed (2026-10-20):** `gate.decide` gained an action-severity rule — a destructive action (`config.DESTRUCTIVE_ACTIONS`) on external/tainted content now escalates straight to `block` once `risk_score >= RISK_APPROVAL_LOW_THRESHOLD` (40), rather than waiting on the score alone to clear 80. 10 steps across 7 of the 8 AgentDojo-derived traces now correctly reach `block`. See `test-data/validation_results.md`.
+- ~~**`trace_18` passes by 2 points**: the thinnest margin in the suite.~~ **Fixed (2026-10-20):** rebalancing `DRIFT_SCORE_WEIGHT`/`INJECTION_CONFIDENCE_WEIGHT` (0.6/0.4 → 0.4/0.6) raised its margin to 10 points, verified not to introduce new false positives on sampled clean traces. `run_validation.py` also now prints a `WARNING` for any step within 5 points of a gate threshold, as a permanent watch against future regression. See `test-data/validation_results.md`.
+- **No live protection**: analysis happens after the agent has already acted. Unaddressed — this is what `/guard/*` (Prompt 1.3, mock skeleton) is building toward; the real (non-mock) implementation lands Day 3.
 
 All of these are assigned in `docs/plan/`.

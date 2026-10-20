@@ -75,9 +75,45 @@ RISK_BLOCK_THRESHOLD = 80
 RISK_APPROVAL_LOW_THRESHOLD = 40
 RISK_APPROVAL_HIGH_THRESHOLD = 80
 
+# Action-severity override — the only place this should be set. gate.decide
+# escalates straight to "block" (skipping approval_required) when a step's
+# action is in this set AND provenance_flag is "external" or "tainted" AND
+# risk_score >= RISK_APPROVAL_LOW_THRESHOLD. This exists because the real
+# judge/drift pipeline's injected-instruction attacks currently top out
+# around risk_score 42-56 (see test-data/validation_results.md) — well
+# under RISK_BLOCK_THRESHOLD (80) — so a step that is both externally/
+# tainted-sourced AND about to take an irreversible, world-affecting action
+# (delete, send, post, invite, etc.) shouldn't wait on the score alone to
+# cross 80 before it's blocked outright. A below-threshold risk_score (e.g.
+# a merely tainted but benign handoff) still only floors at
+# approval_required, same as before — this rule only ever escalates an
+# already-at-least-"approval_required"-by-score step up to "block", never
+# promotes a genuinely low-risk one.
+DESTRUCTIVE_ACTIONS = {
+    "delete_file",
+    "delete_email",
+    "write_file",
+    "send_message",
+    "send_email",
+    "send_direct_message",
+    "post_webpage",
+    "create_calendar_event",
+    "invite_user_to_slack",
+    "add_user_to_channel",
+    "remove_user_from_slack",
+}
+
 # Drift engine risk_score combination weights — must sum to 1.0.
-DRIFT_SCORE_WEIGHT = 0.6
-INJECTION_CONFIDENCE_WEIGHT = 0.4
+# Rebalanced 2026-10-20 (0.6/0.4 -> 0.4/0.6) to fix trace_18's thin margin
+# (see test-data/validation_results.md): the judge's confidence is the more
+# precise signal for "reply hijack"-style attacks where injected text rides
+# inside an otherwise on-topic thread (keeping drift misleadingly low), and
+# confirmed via live re-check that clean traces' risk_score moves DOWN, not
+# up, under this weighting (their judge confidence is consistently lower
+# than their drift_score, the opposite of a true injection) — so this is a
+# net-safer split, not a trade-off against false positives.
+DRIFT_SCORE_WEIGHT = 0.4
+INJECTION_CONFIDENCE_WEIGHT = 0.6
 
 # Agent loop cap — the only place this should be set.
 AGENT_MAX_STEPS = 6

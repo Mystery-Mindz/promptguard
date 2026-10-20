@@ -149,7 +149,7 @@ def analyze_trace(trace: Trace) -> list[DetectionOutput]:
             ) from e
 
         provenance_flag = get_provenance_flag(trace, step.step_id)
-        decision = decide(risk_score, provenance_flag)
+        decision = decide(risk_score, provenance_flag, step.action)
 
         output = DetectionOutput(
             trace_id=trace.trace_id,
@@ -157,7 +157,7 @@ def analyze_trace(trace: Trace) -> list[DetectionOutput]:
             drift_score=drift_score,
             risk_score=risk_score,
             provenance_flag=provenance_flag,
-            classification=classification_for(risk_score),
+            classification=classification_for(decision),
             explanation=_explanation_for(step, drift_score, risk_score, provenance_flag),
             decision=decision,
         )

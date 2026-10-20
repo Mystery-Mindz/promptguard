@@ -23,7 +23,7 @@ A FastAPI backend exposes five endpoints:
 Each step in a trace passes through three independently-testable components, wired together by `main.py`:
 - **Intent Drift Engine** — embeds the step's content and compares it against the original goal, and separately asks a judge model whether the text driving that step looks like an injected instruction. The two signals combine into a 0–100 risk score.
 - **Provenance Tracer** — builds a directed graph of the trace's steps and tags each one `internal`, `external`, or `tainted`, propagating external taint across agent-to-agent handoffs.
-- **Secure Execution Gate** — pure decision logic turning a risk score and provenance flag into `allow_logged`, `approval_required`, or `block` — with a hard floor: anything `tainted` is never auto-allowed, no matter how low its score.
+- **Secure Execution Gate** — pure decision logic turning a risk score, provenance flag, and (optionally) the action being taken into `allow_logged`, `approval_required`, or `block` — with a hard floor (anything `tainted` is never auto-allowed, no matter how low its score) and an action-severity escalation (a destructive action — `delete_file`, `send_email`, etc., the full list lives in `config.DESTRUCTIVE_ACTIONS` — on externally-sourced or tainted content jumps straight to `block` once its score is at least borderline-suspicious, rather than waiting on the score alone to clear the much higher block threshold).
 
 ![Architecture](docs/architecture_diagram.png)
 
