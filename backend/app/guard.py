@@ -14,8 +14,8 @@ from datetime import UTC, datetime
 
 from fastapi import APIRouter, HTTPException
 
-from app import storage
-from app.gate import classification_for
+from app import config, storage
+from app.gate import classification_for, decide
 from app.provenance import get_provenance_flag
 from app.schemas import (
     Decision,
@@ -37,9 +37,10 @@ from app.schemas import (
 router = APIRouter(prefix="/guard", tags=["guard"])
 
 # Deterministic mock-mode scoring rules (no LLM calls) — see Prompt 1.3 in
-# docs/plan/P1_core_backend.md for the exact spec.
+# docs/plan/P1_core_backend.md for the exact spec. The destructive-action
+# set itself lives in config.DESTRUCTIVE_ACTIONS (shared with gate.decide's
+# action-severity rule) rather than a separate local copy here.
 MOCK_SUSPICIOUS_PHRASES = ("ignore previous", "urgent", "administrator", "forward", "delete all")
-MOCK_DESTRUCTIVE_ACTIONS = {"delete_file", "send_message"}
 
 
 def _require_mock_mode() -> None:
@@ -74,46 +75,58 @@ def _get_session_trace(session_id: str) -> Trace:
     return trace
 
 
-def _mock_score(trace_so_far: Trace, step: TraceStep) -> tuple[int, Decision]:
-    """Deterministic, LLM-free scoring for `GUARD_MODE=mock`. Priority
+def _mock_score(trace_so_far: Trace, step: TraceStep) -> int:
+    """Deterministic, LLM-free risk scoring for `GUARD_MODE=mock`. Priority
     order (most severe first): a destructive action after ANY earlier
     external observation in this session is the strongest signal; failing
     that, the step's own text matching a known suspicious phrase; failing
     that, treated as clean. This is intentionally cruder than the real
     pipeline (drift_engine + provenance + gate) landing on Day 3 — it
     exists so P2 can integrate against the real `/guard/*` contract today
-    without waiting on LLM calls.
+    without waiting on LLM calls. The actual enforcement decision for this
+    score is computed afterward by `gate.decide` (see `_score_and_save_step`),
+    same as the real pipeline — this function only produces the score.
 
     Parameters:
     - `trace_so_far`: the session's trace as it was BEFORE this step (so
       "any earlier external observation" doesn't include `step` itself).
     - `step`: the new step being scored.
 
-    Returns a `(risk_score, decision)` tuple: `(85, "block")`,
-    `(60, "approval_required")`, or `(15, "allow_logged")`.
+    Returns a `risk_score`: `85`, `60`, or `15`.
     """
     earlier_external_observation = any(s.input_provenance == "external" for s in trace_so_far.steps)
-    if step.action in MOCK_DESTRUCTIVE_ACTIONS and earlier_external_observation:
-        return 85, "block"
+    if step.action in config.DESTRUCTIVE_ACTIONS and earlier_external_observation:
+        return 85
 
     lowered_text = step.input_text.lower()
     if any(phrase in lowered_text for phrase in MOCK_SUSPICIOUS_PHRASES):
-        return 60, "approval_required"
+        return 60
 
-    return 15, "allow_logged"
+    return 15
 
 
 def _mock_explanation(step: TraceStep, risk_score: int, decision: Decision) -> str:
     """Builds the `explanation` string for a mock-mode detection, mirroring
     the real pipeline's style in `main._explanation_for` but naming the
     deterministic rule that fired instead of real drift/judge scores.
+
+    `risk_score` alone identifies which of `_mock_score`'s rules produced
+    it (85/60/15 are mutually exclusive by construction); `decision` can
+    still differ from the naive risk_score-only mapping when `gate.decide`
+    floors it on taint or escalates it on the action-severity rule, so a
+    `60`-score step can still come back `"block"` if it's also a
+    destructive action on external/tainted content.
     """
-    if decision == "block":
+    if risk_score == 85:
         reason = "a destructive action followed an earlier external observation in this session"
-    elif decision == "approval_required":
+    elif risk_score == 60:
         reason = "input_text matched a mock-mode suspicious phrase"
     else:
         reason = "nothing suspicious matched"
+    if decision == "block" and risk_score != 85:
+        reason += "; escalated to block — destructive action on external/tainted content"
+    elif decision == "approval_required" and risk_score == 15:
+        reason += "; floored to approval_required by tainted provenance"
     return f"Step {step.step_id} ({step.action}): [mock mode] {reason} (risk_score={risk_score})"
 
 
@@ -132,8 +145,9 @@ def _score_and_save_step(session_id: str, trace_before: Trace, step: TraceStep) 
     storage.append_step(session_id, trace_before.agent_id, trace_before.original_goal, step)
 
     trace_with_step = trace_before.model_copy(update={"steps": [*trace_before.steps, step]})
-    risk_score, decision = _mock_score(trace_before, step)
+    risk_score = _mock_score(trace_before, step)
     provenance_flag = get_provenance_flag(trace_with_step, step.step_id)
+    decision = decide(risk_score, provenance_flag, step.action)
 
     output = DetectionOutput(
         trace_id=session_id,
@@ -141,7 +155,7 @@ def _score_and_save_step(session_id: str, trace_before: Trace, step: TraceStep) 
         drift_score=0.0,  # mock mode computes no real drift signal
         risk_score=risk_score,
         provenance_flag=provenance_flag,
-        classification=classification_for(risk_score),
+        classification=classification_for(decision),
         explanation=_mock_explanation(step, risk_score, decision),
         decision=decision,
     )
