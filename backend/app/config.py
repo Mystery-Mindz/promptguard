@@ -51,25 +51,6 @@ def _resolve_gemini_api_key() -> str:
 
 GEMINI_API_KEY = _resolve_gemini_api_key()
 
-# Model names — the only place these should be set.
-# Confirmed against a live client.models.list() call on 2026-09-08 — see
-# run_validation.py / the Gemini migration notes for the full model list.
-# NOTE: the free tier caps EVERY Flash model at only 20 generateContent
-# requests/DAY (GenerateRequestsPerDayPerProjectPerModel-FreeTier), tracked
-# independently per model — there is no separate, higher-quota "stable" GA
-# tier available on this account. The only models whose metadata says
-# "Stable version..." are gemini-2.5-flash / gemini-2.5-flash-lite, and both
-# 404 as "no longer available to new users." The -latest aliases just
-# resolve to gemini-3.8-flash under the hood (same quota bucket). Hit the
-# cap on gemini-3.8-flash, gemini-3.6-flash, gemini-3.7-flash, and
-# gemini-3.5-flash in succession on 2026-09-08 (4 models in one session).
-# On gemini-3.1-flash-lite now (untouched at time of switch, confirmed to
-# support function calling) — same 20/day structure applies; re-check
-# quota before a live demo needing several re-runs.
-AGENT_MODEL = "gemini-3.1-flash-lite"
-JUDGE_MODEL = "gemini-3.1-flash-lite"
-EMBEDDING_MODEL = "gemini-embedding-2"  # latest stable embedContent model
-
 # Gate thresholds — the only place these should be set.
 RISK_BLOCK_THRESHOLD = 80
 RISK_APPROVAL_LOW_THRESHOLD = 40
@@ -126,8 +107,82 @@ DATABASE_PATH = os.getenv(
     "DATABASE_PATH", os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "promptguard.db")
 )
 
-# Gemini call pacing/timeouts — the only place these should be set. Shared by
-# agent.py (agent loop) and drift_engine.py (embedding + judge calls) so a
-# quota-driven change only needs to happen in one place.
-MIN_SECONDS_BETWEEN_GEMINI_CALLS = 13.0
+# Gemini client timeout — the only place this should be set.
 GEMINI_CLIENT_TIMEOUT_MS = 30_000
+
+# --- Provider layer (app/llm.py) -------------------------------------------
+#
+# app/llm.py is the ONLY place that calls model APIs. Everything below
+# configures it; agent.py and drift_engine.py never see a provider or model
+# name directly — they just call llm.generate_with_tools()/judge()/
+# embed_many() and the resolution below decides who actually handles it.
+#
+# Today only "gemini" is registered in app/llm.py's provider table, so
+# these three all default to "gemini" and FALLBACK_PROVIDER defaults to
+# unset (no fallback — a 429/503 that survives retries just raises
+# ModelUnavailable). Adding a second provider (e.g. "groq") means: adding
+# its own (provider, role) entries to MODEL_NAMES and PACING_SECONDS below,
+# registering its generate_with_tools/judge/embed_many/is_retryable
+# functions in app/llm.py's _PROVIDERS dict, and pointing one of these three
+# env vars (or FALLBACK_PROVIDER) at it — none of which touches agent.py,
+# drift_engine.py, or any call site.
+AGENT_PROVIDER = os.getenv("AGENT_PROVIDER", "gemini")
+JUDGE_PROVIDER = os.getenv("JUDGE_PROVIDER", "gemini")
+EMBEDDING_PROVIDER = os.getenv("EMBEDDING_PROVIDER", "gemini")
+# None (unset) = no fallback. Set to a provider name registered in
+# app/llm.py's _PROVIDERS (e.g. "groq", once added) to retry once on a
+# different provider after the primary one exhausts its own retries.
+FALLBACK_PROVIDER = os.getenv("FALLBACK_PROVIDER") or None
+
+# Per-(provider, role) model name registry — the only place these should be
+# set. Confirmed against a live client.models.list() call on 2026-09-08 (see
+# the Gemini migration notes below for the full model list); re-run that
+# before assuming any of these still resolves to something usable.
+# NOTE: the free tier caps EVERY Flash model at only 20 generateContent
+# requests/DAY (GenerateRequestsPerDayPerProjectPerModel-FreeTier), tracked
+# independently per model — there is no separate, higher-quota "stable" GA
+# tier available on this account. The only models whose metadata says
+# "Stable version..." are gemini-2.5-flash / gemini-2.5-flash-lite, and both
+# 404 as "no longer available to new users." The -latest aliases just
+# resolve to gemini-3.8-flash under the hood (same quota bucket). Hit the
+# cap on gemini-3.8-flash, gemini-3.6-flash, gemini-3.7-flash, and
+# gemini-3.5-flash in succession on 2026-09-08 (4 models in one session).
+# On gemini-3.1-flash-lite now (untouched at time of switch, confirmed to
+# support function calling) — same 20/day structure applies; re-check
+# quota before a live demo needing several re-runs.
+AGENT_MODEL = "gemini-3.1-flash-lite"
+JUDGE_MODEL = "gemini-3.1-flash-lite"
+EMBEDDING_MODEL = "gemini-embedding-2"  # latest stable embedContent model
+MODEL_NAMES: dict[tuple[str, str], str] = {
+    ("gemini", "agent"): AGENT_MODEL,
+    ("gemini", "judge"): JUDGE_MODEL,
+    ("gemini", "embedding"): EMBEDDING_MODEL,
+}
+
+# Retry/backoff for a single model call (app/llm.py) — the only place these
+# should be set. On a retryable error (429 "quota exceeded" or 503
+# "overloaded"), retry up to MODEL_MAX_RETRIES times with exponential
+# backoff (MODEL_RETRY_BASE_DELAY_SECONDS * 2**attempt, capped at
+# MODEL_RETRY_MAX_DELAY_SECONDS) before giving up on that provider (and
+# trying FALLBACK_PROVIDER, if configured, with its own fresh set of
+# retries) — see app/llm.py's ModelUnavailable.
+MODEL_MAX_RETRIES = 3
+MODEL_RETRY_BASE_DELAY_SECONDS = 1.0
+MODEL_RETRY_MAX_DELAY_SECONDS = 30.0
+
+# Call pacing per provider (app/llm.py) — the only place this should be set.
+# Gemini's free tier caps generate_content/embed_content at a few requests
+# per minute per model; without a floor on the gap between calls, a chain
+# of calls fails into 429s that compound into multi-minute stalls. Keyed by
+# provider name (not model) since today every Gemini-backed role shares the
+# same free-tier pacing; a future provider with different limits gets its
+# own entry here. Falls back to DEFAULT_PACING_SECONDS for an unlisted
+# provider.
+PACING_SECONDS: dict[str, float] = {"gemini": 13.0}
+DEFAULT_PACING_SECONDS = 5.0
+
+# In-memory LRU cache size (app/llm.py) — the only place this should be set.
+# Caps memory use; the DB-backed cache (the `llm_cache` table, via
+# storage.py) has no size cap and is the source of truth across process
+# restarts — the LRU is just a fast, in-process front for it.
+LLM_CACHE_MAX_ENTRIES = 1000

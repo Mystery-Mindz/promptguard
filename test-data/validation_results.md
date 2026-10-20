@@ -12,7 +12,30 @@ AgentDojo-derived set (8), adapted from the `workspace` and `slack` suites (`age
 
 Full breakdown and reproduction: `python run_validation.py` from `backend/` (default now scans both `../test-data/traces` and `../test-data/agentdojo_subset`).
 
-**⚠️ Quota note (unchanged from the original run):** full validation needs 53 judge calls + 106 embedding calls, which is more than the free tier's ~20/model/day. The 2026-10-20 update below was validated with a small number of *targeted* live calls (one step at a time, via `compute_drift_and_risk`/`_classify_injection` directly) rather than a full `run_validation.py` re-run, for exactly this reason — see "How this update was verified" below for which numbers are real live-call results and which are derived from the code's own guarantees.
+**⚠️ Quota note, updated 2026-10-20 (Prompt 2.1 — see the batching/caching section below):** full validation across both directories is 26 trace files totaling 53 steps, so still **53 judge calls** (judge is per-step, not batched) — still over the free tier's ~20/model/day on its own. **Embedding calls, however, dropped from 106 to 26** — one batched `embed_many` call per TRACE (goal + every step's text together) instead of two separate calls per STEP — so embeddings alone now almost fit in a single day's quota, and a full run is 79 total model calls instead of 159. The judge-call bottleneck is unchanged: full validation still can't be reproduced in one day on the free tier, and `run_validation.py --limit`/`--results-file` (also added in Prompt 2.1) exists specifically to spread it across several days without re-paying for traces already scored. The action-severity-rule section below was validated with a small number of *targeted* live calls (one step at a time, via `compute_drift_and_risk`/`_classify_injection` directly) rather than a full `run_validation.py` re-run, for exactly this reason — see "How this update was verified" there for which numbers are real live-call results and which are derived from the code's own guarantees.
+
+---
+
+## 2026-10-20 update: provider layer, batched embeddings, caching, retries (Prompt 2.1 — provider-independent part; Gemini only for now)
+
+**What changed** (full detail in `backend/CLAUDE.md`'s `llm.py`/`agent.py`/`drift_engine.py` entries — this section is the "report the numbers" half of that work):
+
+- **`app/llm.py`** is now the only place that calls a model API. `agent.py` and `drift_engine.py` were rewritten to go through it (`generate_with_tools`/`judge`/`embed_many`) instead of calling `google-genai` directly — behavior-preserving; no detection logic changed.
+- **Batched embeddings**: `drift_engine.py` now embeds a trace's goal and every step's text in ONE `embed_many` call per trace, instead of two separate `embed_content` calls per step (goal + action, every single step, re-embedding the identical goal text every time).
+- **Caching**: `judge()` and `embed_many()` share an in-memory LRU + a `llm_cache` DB table, keyed on `sha256(model + text)`. Repeat analysis of the same content (a re-run, or the same email body appearing in two traces) is now a real cache hit with zero model calls.
+- **Retries + typed error**: a 429/503 is retried with exponential backoff (`tenacity`) before raising `llm.ModelUnavailable`, which `main.py` maps to a clean 503 for both `/analyze-trace` and `/run-agent` (previously only `/analyze-trace` had any such handling, and it caught every exception generically rather than this specifically).
+- **`run_validation.py`**: `--base-url`'s timeout raised from a hardcoded 30s to a configurable `--timeout` (default 120s) — 30s was already too tight for a multi-step trace's paced, now-possibly-retried calls. New `--limit` (cap how many not-yet-run traces one invocation scores) and `--results-file` (persist per-trace results; a later run with the same path skips everything already recorded, resuming instead of re-paying quota) — see the Quota note above for why this exists.
+
+**Measured model-call count, the real 3-step cross-agent-handoff demo trace (`test-data/demo_cross_agent_handoff.json`), counted with every model call mocked (no live calls — see `backend/tests/test_main.py::test_analyze_trace_batches_embeddings_across_the_whole_trace`, which locks this in as a regression test):**
+
+| | embed calls | judge calls | **total** |
+|---|---|---|---|
+| Before (one `embed_content` per goal + per step) | 6 | 3 | **9** |
+| After (one batched `embed_many` per trace) | 1 | 3 | **4** |
+
+Judge calls are unchanged (still one per step — not a batchable operation the way embeddings are); embed calls for this trace drop from 6 to 1 (goal re-embedded 3 times before, once after). Scaled to the full 26-trace/53-step validation suite (see the Quota note above): embed calls 106 → 26, judge calls unchanged at 53, total model calls 159 → 79.
+
+**No decision changed.** This is a transport/performance change only — `compute_drift_and_risk`'s formula, `INJECTION_CLASSIFIER_PROMPT`, and every weight/threshold are untouched, so no fixture's `expected_flagged_steps` or any trace's `risk_score` is affected by this update (distinct from the `DRIFT_SCORE_WEIGHT` rebalance in the action-severity section below, which does change `risk_score` values).
 
 ---
 

@@ -1,47 +1,11 @@
 import math
 import secrets
-import time
+import weakref
 from typing import Any
 
-from google import genai
-from google.genai import types
-
-from app.config import (
-    DRIFT_SCORE_WEIGHT,
-    EMBEDDING_MODEL,
-    GEMINI_API_KEY,
-    INJECTION_CONFIDENCE_WEIGHT,
-    JUDGE_MODEL,
-    MIN_SECONDS_BETWEEN_GEMINI_CALLS,
-)
+from app import llm
+from app.config import DRIFT_SCORE_WEIGHT, INJECTION_CONFIDENCE_WEIGHT
 from app.schemas import Trace, TraceStep
-
-# Gemini's free tier caps requests/minute per model. Pacing keeps normal
-# runs under that in the first place; the SDK's own internal exponential
-# backoff (retries on 429/5xx before raising) stays in place underneath
-# this as the fallback for whatever pacing doesn't prevent — one doesn't
-# replace the other. Keyed by model name since embeddings and judge calls
-# hit independent quota buckets and shouldn't throttle each other.
-_last_call_at: dict[str, float] = {}
-
-
-def _pace_calls(model: str) -> None:
-    """Pauses execution (if needed) so that consecutive calls to the given
-    Gemini `model` are always at least `MIN_SECONDS_BETWEEN_GEMINI_CALLS`
-    seconds apart. Each model is paced independently (tracked by name in
-    `_last_call_at`), since the embedding model and the judge model have
-    separate quota buckets and shouldn't throttle each other.
-
-    Parameters:
-    - `model`: the Gemini model name about to be called.
-
-    Returns nothing — it just sleeps for the remaining wait time, if any.
-    """
-    last = _last_call_at.get(model, 0.0)
-    elapsed = time.monotonic() - last
-    if elapsed < MIN_SECONDS_BETWEEN_GEMINI_CALLS:
-        time.sleep(MIN_SECONDS_BETWEEN_GEMINI_CALLS - elapsed)
-    _last_call_at[model] = time.monotonic()
 
 INJECTION_CLASSIFIER_PROMPT = (
     "You are a security classifier for an AI agent's action log. Given a piece of "
@@ -80,19 +44,6 @@ INJECTION_CLASSIFIER_PROMPT = (
     "Text:\n<{boundary_tag}>\n{input_text}\n</{boundary_tag}>\n\n"
     "Respond with the number and nothing else."
 )
-
-_client: genai.Client | None = None
-
-
-def _get_client() -> genai.Client:
-    """Returns a shared Gemini API client, creating it the first time this is
-    called and reusing it afterward. Takes no parameters; returns a
-    `genai.Client` authenticated with the API key from `.env`.
-    """
-    global _client
-    if _client is None:
-        _client = genai.Client(api_key=GEMINI_API_KEY)
-    return _client
 
 
 def _describe_action(action: str, action_params: dict[str, Any]) -> str:
@@ -139,23 +90,6 @@ def _text_to_embed_for_drift(step: TraceStep) -> str:
     return _describe_action(step.action, step.action_params)
 
 
-def _embed(text: str) -> list[float]:
-    """Converts a piece of text into a numeric vector (an "embedding") using
-    Gemini's embedding model, so it can be compared to other text for
-    semantic similarity.
-
-    Parameters:
-    - `text`: the text to embed.
-
-    Returns the embedding as a list of floats.
-    """
-    _pace_calls(EMBEDDING_MODEL)
-    client = _get_client()
-    response = client.models.embed_content(model=EMBEDDING_MODEL, contents=[text])
-    assert response.embeddings, "embed_content returned no embeddings"
-    return list(response.embeddings[0].values or [])
-
-
 def _cosine_similarity(a: list[float], b: list[float]) -> float:
     """Measures how similar two embedding vectors are in direction,
     regardless of their magnitude — the standard way to compare embeddings
@@ -177,7 +111,7 @@ def _cosine_similarity(a: list[float], b: list[float]) -> float:
 
 
 def _classify_injection(input_text: str) -> float:
-    """Asks Gemini (acting as a "judge" model) to rate how much a piece of
+    """Asks the judge model (via `llm.judge`) to rate how much a piece of
     text looks like an injected instruction — an attempt to redirect the
     agent — rather than a normal continuation of its task. Uses
     `INJECTION_CLASSIFIER_PROMPT`, which includes calibration examples so
@@ -202,23 +136,59 @@ def _classify_injection(input_text: str) -> float:
     untrusted-text block and dictate their own score (BUG-07). Any literal
     occurrence of that exact tag already inside `input_text` is stripped
     first so it can't prematurely close the block either.
+
+    `llm.judge` is given `input_text` itself (not the rendered prompt) as
+    its cache key, so repeat classification of the same content is a real
+    cache hit with no model call — the random boundary tag only affects
+    what's sent to the model on an actual miss, not whether a hit is
+    possible; see `app/llm.py`'s module docstring.
     """
     boundary_tag = f"untrusted_{secrets.token_hex(3)}"
     sanitized_text = input_text.replace(f"<{boundary_tag}>", "").replace(f"</{boundary_tag}>", "")
+    prompt = INJECTION_CLASSIFIER_PROMPT.format(boundary_tag=boundary_tag, input_text=sanitized_text)
 
-    _pace_calls(JUDGE_MODEL)
-    client = _get_client()
-    response = client.models.generate_content(
-        model=JUDGE_MODEL,
-        contents=INJECTION_CLASSIFIER_PROMPT.format(boundary_tag=boundary_tag, input_text=sanitized_text),
-        config=types.GenerateContentConfig(temperature=0),
-    )
-    content = (response.text or "").strip()
+    content = llm.judge(prompt, cache_key=input_text).strip()
     try:
         confidence = float(content)
     except ValueError:
         confidence = 0.5
     return max(0.0, min(1.0, confidence))
+
+
+# Per-trace batched embeddings: {id(trace): {0: goal_vector, step_id: vector}}.
+# compute_drift_and_risk is called once per step (from main.py's loop), but
+# every step of the SAME trace shares one batched llm.embed_many call --
+# the first call for a given trace object computes and caches all of them;
+# every later call for another step of that same trace just looks its
+# vector up. Keyed by id(trace) (identity, not value — Trace isn't
+# hashable) with a weakref.finalize callback to evict the entry the moment
+# the trace object is garbage-collected, so this can't both leak memory
+# over the app's lifetime AND can't suffer from a stale entry being served
+# to a different, later trace that happens to get the same id() after
+# reuse (the entry is gone before that id could be reused).
+_trace_embeddings: dict[int, dict[int, list[float]]] = {}
+
+
+def _embeddings_for_trace(trace: Trace) -> dict[int, list[float]]:
+    """Returns `{0: goal_vector, step_id: step_vector, ...}` for `trace`,
+    computing it with exactly one batched `llm.embed_many` call the first
+    time this is called for a given trace object, and reusing it for every
+    subsequent step of that same trace."""
+    key = id(trace)
+    cached = _trace_embeddings.get(key)
+    if cached is not None:
+        return cached
+
+    texts = [trace.original_goal] + [_text_to_embed_for_drift(step) for step in trace.steps]
+    vectors = llm.embed_many(texts)
+
+    result = {0: vectors[0]}
+    for step, vector in zip(trace.steps, vectors[1:], strict=True):
+        result[step.step_id] = vector
+
+    _trace_embeddings[key] = result
+    weakref.finalize(trace, _trace_embeddings.pop, key, None)
+    return result
 
 
 def compute_drift_and_risk(trace: Trace, step_id: int) -> tuple[float, int]:
@@ -234,17 +204,22 @@ def compute_drift_and_risk(trace: Trace, step_id: int) -> tuple[float, int]:
     Returns a `(drift_score, risk_score)` tuple:
     - `drift_score` (0.0-1.0): `1 - cosine_similarity` between embeddings of
       the trace's `original_goal` and a description of this step's action —
-      low similarity to the stated goal means high drift.
-    - `risk_score` (0-100 integer): blends `drift_score` with a Gemini
-      judge's 0-1 confidence that the step's `input_text` looks like an
+      low similarity to the stated goal means high drift. The goal and
+      every step's text are embedded together in ONE batched call per
+      trace (see `_embeddings_for_trace`), not one call per step.
+    - `risk_score` (0-100 integer): blends `drift_score` with a judge
+      model's 0-1 confidence that the step's `input_text` looks like an
       injected instruction, weighted by `DRIFT_SCORE_WEIGHT` /
       `INJECTION_CONFIDENCE_WEIGHT` (see `config.py`), then scaled to 0-100.
+
+    Raises `llm.ModelUnavailable` if the configured provider (and
+    fallback, if any) can't complete a call even after retries —
+    `main.py` maps that to a clean HTTP 503.
     """
     step = next(s for s in trace.steps if s.step_id == step_id)
 
-    goal_embedding = _embed(trace.original_goal)
-    action_embedding = _embed(_text_to_embed_for_drift(step))
-    similarity = _cosine_similarity(goal_embedding, action_embedding)
+    embeddings = _embeddings_for_trace(trace)
+    similarity = _cosine_similarity(embeddings[0], embeddings[step_id])
     drift_score = max(0.0, min(1.0, 1 - similarity))
 
     injection_confidence = _classify_injection(step.input_text)
