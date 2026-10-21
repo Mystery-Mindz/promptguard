@@ -24,7 +24,7 @@ GUARD_HEADERS = {"X-PromptGuard-Key": "test-promptguard-key"}
 
 @pytest.fixture(autouse=True)
 def temp_db(tmp_path, monkeypatch):
-    monkeypatch.setattr(config, "DATABASE_PATH", str(tmp_path / "test.db"))
+    monkeypatch.setattr(config, "DATABASE_URL", f"sqlite:///{tmp_path / 'test.db'}")
     storage.init_db()
 
 

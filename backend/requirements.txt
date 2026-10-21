@@ -14,6 +14,13 @@
 #
 # bcrypt and PyJWT added for Prompt 4.1 (app/auth.py): bcrypt hashes
 # operator passwords, PyJWT signs/verifies the operator login token.
+#
+# SQLAlchemy (Core only, no ORM) and psycopg added for Prompt 4.2
+# (app/storage.py): one code path for both SQLite (local/tests) and
+# Postgres (production), chosen by DATABASE_URL. A bare `postgresql://`
+# URL is rewritten to use the psycopg (3.x) driver at engine-creation time
+# (see storage._normalize_database_url) rather than requiring every
+# deployment's DATABASE_URL to spell that out.
 annotated-doc==0.0.5
 annotated-types==0.8.0
 anyio==4.15.1
@@ -45,10 +52,13 @@ pydantic_core==2.46.5
 Pygments==2.21.0
 PyJWT==2.15.1
 pytest==9.1.1
+psycopg==3.3.6
+psycopg-binary==3.3.6
 python-dotenv==1.2.3
 PyYAML==6.0.3
 requests==2.34.2
 sniffio==1.3.1
+SQLAlchemy==2.1.5
 starlette==1.6.0
 tenacity==9.1.4
 typing-inspection==0.4.4

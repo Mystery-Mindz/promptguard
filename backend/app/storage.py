@@ -1,161 +1,188 @@
+"""Persistence for PromptGuard, via SQLAlchemy Core (no ORM) so one code
+path serves both backends (Prompt 4.2): SQLite locally and in tests,
+Postgres in production (Render's free disk is wiped on every redeploy —
+Neon's Postgres isn't). Chosen by `config.DATABASE_URL`
+(`sqlite:///path/to/file.db` or `postgresql://user:pass@host/db`); every
+public function below has the exact same signature and behavior
+regardless of which one is active.
+
+Every table lives in `metadata` below: `traces`/`trace_steps` (a live
+`/guard/*` session IS a trace, `trace_id` == `session_id` — there's no
+separate "sessions" table), `detection_outputs`, `approval_decisions`,
+`operators`, and `llm_cache`.
+"""
+
 import json
-import sqlite3
-from contextlib import contextmanager
 from datetime import UTC, datetime
 from typing import Any
+
+from sqlalchemy import (
+    Column,
+    Engine,
+    Float,
+    Integer,
+    MetaData,
+    String,
+    Table,
+    Text,
+    and_,
+    create_engine,
+    delete,
+    insert,
+    select,
+    text,
+)
+from sqlalchemy.dialects import postgresql, sqlite
+from sqlalchemy.engine import Connection
 
 from app import config
 from app.schemas import DetectionOutput, Trace, TraceStep, TraceWithDetections
 
+metadata = MetaData()
 
-@contextmanager
-def _connect():
-    """Opens a connection to the SQLite database at `config.DATABASE_PATH`
-    for use in a `with` block, committing any changes automatically when
-    the block exits normally, and always closing the connection afterward.
+traces_table = Table(
+    "traces",
+    metadata,
+    Column("trace_id", String, primary_key=True),
+    Column("agent_id", String, nullable=False),
+    Column("original_goal", Text, nullable=False),
+    Column("created_at", String),
+)
 
-    Takes no parameters. Yields a `sqlite3.Connection` for the caller to
-    run queries on.
+trace_steps_table = Table(
+    "trace_steps",
+    metadata,
+    Column("trace_id", String, primary_key=True),
+    Column("step_id", Integer, primary_key=True),
+    Column("actor", String, nullable=False),
+    Column("input_text", Text, nullable=False),
+    Column("input_source", String, nullable=False),
+    Column("input_provenance", String, nullable=False),
+    Column("action", String, nullable=False),
+    Column("action_params", Text, nullable=False),  # JSON-encoded
+    Column("timestamp", String, nullable=False),
+)
+
+detection_outputs_table = Table(
+    "detection_outputs",
+    metadata,
+    Column("trace_id", String, primary_key=True),
+    Column("step_id", Integer, primary_key=True),
+    Column("drift_score", Float, nullable=False),
+    Column("risk_score", Integer, nullable=False),
+    Column("provenance_flag", String, nullable=False),
+    Column("classification", String, nullable=False),
+    Column("explanation", Text, nullable=False),
+    Column("decision", String, nullable=False),
+    Column("created_at", String),
+)
+
+approval_decisions_table = Table(
+    "approval_decisions",
+    metadata,
+    Column("trace_id", String, primary_key=True),
+    Column("step_id", Integer, primary_key=True),
+    Column("operator_decision", String, nullable=False),
+    Column("operator_id", String),
+    Column("final_status", String, nullable=False),
+    Column("timestamp", String, nullable=False),
+)
+
+llm_cache_table = Table(
+    "llm_cache",
+    metadata,
+    Column("cache_key", String, primary_key=True),
+    Column("model", String, nullable=False),
+    Column("value", Text, nullable=False),
+    Column("created_at", String, nullable=False),
+)
+
+operators_table = Table(
+    "operators",
+    metadata,
+    Column("id", Integer, primary_key=True, autoincrement=True),
+    Column("username", String, nullable=False, unique=True),
+    Column("password_hash", Text, nullable=False),
+    Column("created_at", String, nullable=False),
+)
+
+
+def _normalize_database_url(url: str) -> str:
+    """`config.DATABASE_URL` is documented (and typically copy-pasted from
+    Render/Neon) as a plain `postgresql://...` URL — but SQLAlchemy's bare
+    `postgresql://` dialect defaults to the (unmaintained-for-new-projects)
+    psycopg2 driver. Rewrites that one scheme to `postgresql+psycopg://`
+    so the modern psycopg (3.x) driver is used instead, without requiring
+    every deployment's `DATABASE_URL` to know that detail. Every other
+    scheme (`sqlite://...`, or an already-explicit `postgresql+<driver>://`)
+    passes through unchanged.
     """
-    conn = sqlite3.connect(config.DATABASE_PATH)
-    try:
-        yield conn
-        conn.commit()
-    finally:
-        conn.close()
+    if url.startswith("postgresql://"):
+        return "postgresql+psycopg://" + url[len("postgresql://") :]
+    return url
+
+
+# Cached per URL (not a single module-level global) so a test that
+# monkeypatches config.DATABASE_URL to a fresh temp-file URL transparently
+# gets its own engine, while production (DATABASE_URL never changes at
+# runtime) gets exactly one persistent, connection-pooled Engine reused
+# across every call -- the same trade-off a hardcoded module-level engine
+# would make, minus the test-isolation problem that would cause.
+_engines: dict[str, Engine] = {}
+
+
+def _get_engine() -> Engine:
+    url = config.DATABASE_URL
+    engine = _engines.get(url)
+    if engine is None:
+        connect_args = {"check_same_thread": False} if url.startswith("sqlite") else {}
+        engine = create_engine(_normalize_database_url(url), connect_args=connect_args, future=True)
+        _engines[url] = engine
+    return engine
+
+
+def _upsert(table: Table):
+    """Returns the dialect-appropriate `INSERT ... ON CONFLICT` construct
+    for `table` -- SQLite and Postgres both implement `ON CONFLICT`
+    (unlike, say, MySQL's `ON DUPLICATE KEY UPDATE`), so both dialects'
+    `insert()` expose the same `on_conflict_do_update`/`on_conflict_do_nothing`
+    methods; only the import differs.
+    """
+    if _get_engine().dialect.name == "postgresql":
+        return postgresql.insert(table)
+    return sqlite.insert(table)
 
 
 def init_db() -> None:
-    """Creates every table PromptGuard needs (`detection_outputs`,
-    `approval_decisions`, `traces`, `trace_steps`) if they don't already
-    exist, and runs a small one-time migration to backfill the
-    `created_at` column on `detection_outputs` for databases created before
-    that column existed. Safe to call every time the app starts — existing
-    tables and data are left alone.
+    """Creates every table PromptGuard needs if it doesn't already exist
+    (`metadata.create_all(..., checkfirst=True)` — the SQLAlchemy
+    equivalent of `CREATE TABLE IF NOT EXISTS`, for both SQLite and
+    Postgres). Safe to call every time the app starts — existing tables
+    and data are left alone; this never ALTERs an existing table.
 
     Takes no parameters and returns nothing.
     """
-    with _connect() as conn:
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS detection_outputs (
-                trace_id TEXT NOT NULL,
-                step_id INTEGER NOT NULL,
-                drift_score REAL NOT NULL,
-                risk_score INTEGER NOT NULL,
-                provenance_flag TEXT NOT NULL,
-                classification TEXT NOT NULL,
-                explanation TEXT NOT NULL,
-                decision TEXT NOT NULL,
-                created_at TEXT,
-                PRIMARY KEY (trace_id, step_id)
-            )
-            """
-        )
-        # Migration for DBs created before created_at existed — add the
-        # column and backfill any existing rows so /pending-approvals can
-        # rely on it always being present, without discarding real records.
-        columns = {row[1] for row in conn.execute("PRAGMA table_info(detection_outputs)").fetchall()}
-        if "created_at" not in columns:
-            conn.execute("ALTER TABLE detection_outputs ADD COLUMN created_at TEXT")
-        conn.execute(
-            "UPDATE detection_outputs SET created_at = ? WHERE created_at IS NULL",
-            (datetime.now(UTC).isoformat(),),
-        )
-
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS approval_decisions (
-                trace_id TEXT NOT NULL,
-                step_id INTEGER NOT NULL,
-                operator_decision TEXT NOT NULL,
-                operator_id TEXT,
-                final_status TEXT NOT NULL,
-                timestamp TEXT NOT NULL,
-                PRIMARY KEY (trace_id, step_id)
-            )
-            """
-        )
-
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS traces (
-                trace_id TEXT PRIMARY KEY,
-                agent_id TEXT NOT NULL,
-                original_goal TEXT NOT NULL,
-                created_at TEXT
-            )
-            """
-        )
-        # Migration for DBs created before created_at existed on `traces`
-        # (needed for GET /guard/sessions to order/display sessions by
-        # creation time) — same backfill pattern as detection_outputs above.
-        trace_columns = {row[1] for row in conn.execute("PRAGMA table_info(traces)").fetchall()}
-        if "created_at" not in trace_columns:
-            conn.execute("ALTER TABLE traces ADD COLUMN created_at TEXT")
-        conn.execute(
-            "UPDATE traces SET created_at = ? WHERE created_at IS NULL",
-            (datetime.now(UTC).isoformat(),),
-        )
-
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS trace_steps (
-                trace_id TEXT NOT NULL,
-                step_id INTEGER NOT NULL,
-                actor TEXT NOT NULL,
-                input_text TEXT NOT NULL,
-                input_source TEXT NOT NULL,
-                input_provenance TEXT NOT NULL,
-                action TEXT NOT NULL,
-                action_params TEXT NOT NULL,
-                timestamp TEXT NOT NULL,
-                PRIMARY KEY (trace_id, step_id)
-            )
-            """
-        )
-
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS llm_cache (
-                cache_key TEXT PRIMARY KEY,
-                model TEXT NOT NULL,
-                value TEXT NOT NULL,
-                created_at TEXT NOT NULL
-            )
-            """
-        )
-
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS operators (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                username TEXT NOT NULL UNIQUE,
-                password_hash TEXT NOT NULL,
-                created_at TEXT NOT NULL
-            )
-            """
-        )
+    metadata.create_all(_get_engine(), checkfirst=True)
 
 
-def _delete_trace_rows(conn: sqlite3.Connection, trace_id: str) -> None:
+def _delete_trace_rows(conn: Connection, trace_id: str) -> None:
     """Deletes every row derived from a trace_id across `trace_steps`,
     `detection_outputs`, and `approval_decisions` (but not the `traces` row
     itself), using the caller's already-open connection so the deletes
     share the caller's transaction.
 
     Parameters:
-    - `conn`: an open connection (inside a `with _connect() as conn:` block).
+    - `conn`: an open connection (inside a `with engine.begin() as conn:` block).
     - `trace_id`: the trace whose derived rows should be deleted.
 
     Returns nothing.
     """
-    conn.execute("DELETE FROM trace_steps WHERE trace_id = ?", (trace_id,))
-    conn.execute("DELETE FROM detection_outputs WHERE trace_id = ?", (trace_id,))
-    conn.execute("DELETE FROM approval_decisions WHERE trace_id = ?", (trace_id,))
+    conn.execute(delete(trace_steps_table).where(trace_steps_table.c.trace_id == trace_id))
+    conn.execute(delete(detection_outputs_table).where(detection_outputs_table.c.trace_id == trace_id))
+    conn.execute(delete(approval_decisions_table).where(approval_decisions_table.c.trace_id == trace_id))
 
 
-def _insert_step_row(conn: sqlite3.Connection, trace_id: str, step: TraceStep) -> None:
+def _insert_step_row(conn: Connection, trace_id: str, step: TraceStep) -> None:
     """Inserts one step's row into `trace_steps`, using the caller's
     already-open connection so it shares the caller's transaction. Shared
     by `save_trace` (which deletes all of a trace_id's old steps first)
@@ -170,22 +197,17 @@ def _insert_step_row(conn: sqlite3.Connection, trace_id: str, step: TraceStep) -
     Returns nothing.
     """
     conn.execute(
-        """
-        INSERT INTO trace_steps
-            (trace_id, step_id, actor, input_text, input_source, input_provenance, action, action_params, timestamp)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        (
-            trace_id,
-            step.step_id,
-            step.actor,
-            step.input_text,
-            step.input_source,
-            step.input_provenance,
-            step.action,
-            json.dumps(step.action_params),
-            step.timestamp.isoformat(),
-        ),
+        insert(trace_steps_table).values(
+            trace_id=trace_id,
+            step_id=step.step_id,
+            actor=step.actor,
+            input_text=step.input_text,
+            input_source=step.input_source,
+            input_provenance=step.input_provenance,
+            action=step.action,
+            action_params=json.dumps(step.action_params),
+            timestamp=step.timestamp.isoformat(),
+        )
     )
 
 
@@ -210,18 +232,23 @@ def save_trace(trace: Trace) -> None:
     `created_at` is preserved across re-analysis (only set the first time
     a given `trace_id` is seen).
     """
-    with _connect() as conn:
+    with _get_engine().begin() as conn:
         _delete_trace_rows(conn, trace.trace_id)
 
+        upsert_stmt = _upsert(traces_table).values(
+            trace_id=trace.trace_id,
+            agent_id=trace.agent_id,
+            original_goal=trace.original_goal,
+            created_at=datetime.now(UTC).isoformat(),
+        )
         conn.execute(
-            """
-            INSERT INTO traces (trace_id, agent_id, original_goal, created_at)
-            VALUES (?, ?, ?, ?)
-            ON CONFLICT(trace_id) DO UPDATE SET
-                agent_id = excluded.agent_id,
-                original_goal = excluded.original_goal
-            """,
-            (trace.trace_id, trace.agent_id, trace.original_goal, datetime.now(UTC).isoformat()),
+            upsert_stmt.on_conflict_do_update(
+                index_elements=["trace_id"],
+                set_={
+                    "agent_id": upsert_stmt.excluded.agent_id,
+                    "original_goal": upsert_stmt.excluded.original_goal,
+                },
+            )
         )
         for step in trace.steps:
             _insert_step_row(conn, trace.trace_id, step)
@@ -239,19 +266,32 @@ def get_trace(trace_id: str) -> Trace | None:
     `save_trace` (e.g. it was only ever run through the old code path that
     predates trace persistence, or the ID is simply wrong).
     """
-    with _connect() as conn:
-        conn.row_factory = sqlite3.Row
+    with _get_engine().connect() as conn:
         trace_row = conn.execute(
-            "SELECT trace_id, agent_id, original_goal FROM traces WHERE trace_id = ?",
-            (trace_id,),
-        ).fetchone()
+            select(traces_table.c.trace_id, traces_table.c.agent_id, traces_table.c.original_goal).where(
+                traces_table.c.trace_id == trace_id
+            )
+        ).mappings().fetchone()
         if trace_row is None:
             return None
-        step_rows = conn.execute(
-            "SELECT step_id, actor, input_text, input_source, input_provenance, action, action_params, timestamp "
-            "FROM trace_steps WHERE trace_id = ? ORDER BY step_id ASC",
-            (trace_id,),
-        ).fetchall()
+        step_rows = (
+            conn.execute(
+                select(
+                    trace_steps_table.c.step_id,
+                    trace_steps_table.c.actor,
+                    trace_steps_table.c.input_text,
+                    trace_steps_table.c.input_source,
+                    trace_steps_table.c.input_provenance,
+                    trace_steps_table.c.action,
+                    trace_steps_table.c.action_params,
+                    trace_steps_table.c.timestamp,
+                )
+                .where(trace_steps_table.c.trace_id == trace_id)
+                .order_by(trace_steps_table.c.step_id.asc())
+            )
+            .mappings()
+            .fetchall()
+        )
 
     steps = [
         TraceStep(
@@ -315,14 +355,16 @@ def append_step(trace_id: str, agent_id: str, original_goal: str, step: TraceSte
 
     Returns nothing.
     """
-    with _connect() as conn:
+    with _get_engine().begin() as conn:
         conn.execute(
-            """
-            INSERT INTO traces (trace_id, agent_id, original_goal, created_at)
-            VALUES (?, ?, ?, ?)
-            ON CONFLICT(trace_id) DO NOTHING
-            """,
-            (trace_id, agent_id, original_goal, datetime.now(UTC).isoformat()),
+            _upsert(traces_table)
+            .values(
+                trace_id=trace_id,
+                agent_id=agent_id,
+                original_goal=original_goal,
+                created_at=datetime.now(UTC).isoformat(),
+            )
+            .on_conflict_do_nothing(index_elements=["trace_id"])
         )
         _insert_step_row(conn, trace_id, step)
 
@@ -340,34 +382,39 @@ def list_sessions(limit: int = 20) -> list[dict]:
     `None` if nothing has been scored yet), and `worst_decision` (the most
     severe `decision` recorded — `block` > `approval_required` >
     `allow_logged` — or `None` if nothing has been scored yet).
+
+    Expressed as one `text()` query (standard SQL — correlated subqueries
+    and a `CASE` expression, nothing dialect-specific) rather than
+    SQLAlchemy Core's expression language, since translating it 1:1 would
+    be far more verbose for no behavioral difference; SQLAlchemy still
+    handles the `:limit` bind parameter per-dialect.
     """
-    with _connect() as conn:
-        conn.row_factory = sqlite3.Row
-        rows = conn.execute(
-            """
-            SELECT
-                t.trace_id,
-                t.agent_id,
-                t.original_goal,
-                t.created_at,
-                (SELECT COUNT(*) FROM trace_steps ts WHERE ts.trace_id = t.trace_id) AS step_count,
-                (SELECT MAX(d.risk_score) FROM detection_outputs d WHERE d.trace_id = t.trace_id) AS max_risk,
-                (
-                    SELECT d2.decision FROM detection_outputs d2 WHERE d2.trace_id = t.trace_id
-                    ORDER BY CASE d2.decision
-                        WHEN 'block' THEN 3
-                        WHEN 'approval_required' THEN 2
-                        WHEN 'allow_logged' THEN 1
-                        ELSE 0
-                    END DESC
-                    LIMIT 1
-                ) AS worst_decision
-            FROM traces t
-            ORDER BY t.created_at DESC
-            LIMIT ?
-            """,
-            (limit,),
-        ).fetchall()
+    query = text(
+        """
+        SELECT
+            t.trace_id,
+            t.agent_id,
+            t.original_goal,
+            t.created_at,
+            (SELECT COUNT(*) FROM trace_steps ts WHERE ts.trace_id = t.trace_id) AS step_count,
+            (SELECT MAX(d.risk_score) FROM detection_outputs d WHERE d.trace_id = t.trace_id) AS max_risk,
+            (
+                SELECT d2.decision FROM detection_outputs d2 WHERE d2.trace_id = t.trace_id
+                ORDER BY CASE d2.decision
+                    WHEN 'block' THEN 3
+                    WHEN 'approval_required' THEN 2
+                    WHEN 'allow_logged' THEN 1
+                    ELSE 0
+                END DESC
+                LIMIT 1
+            ) AS worst_decision
+        FROM traces t
+        ORDER BY t.created_at DESC
+        LIMIT :limit
+        """
+    )
+    with _get_engine().connect() as conn:
+        rows = conn.execute(query, {"limit": limit}).mappings().fetchall()
     return [dict(row) for row in rows]
 
 
@@ -384,9 +431,9 @@ def delete_trace(trace_id: str) -> None:
 
     Returns nothing. Safe to call even if `trace_id` was never saved.
     """
-    with _connect() as conn:
+    with _get_engine().begin() as conn:
         _delete_trace_rows(conn, trace_id)
-        conn.execute("DELETE FROM traces WHERE trace_id = ?", (trace_id,))
+        conn.execute(delete(traces_table).where(traces_table.c.trace_id == trace_id))
 
 
 def get_detection_outputs_for_trace(trace_id: str) -> list[dict]:
@@ -400,13 +447,25 @@ def get_detection_outputs_for_trace(trace_id: str) -> list[dict]:
     alongside `get_trace` to show both the original trace and what
     PromptGuard concluded about each step.
     """
-    with _connect() as conn:
-        conn.row_factory = sqlite3.Row
-        rows = conn.execute(
-            "SELECT trace_id, step_id, drift_score, risk_score, provenance_flag, classification, explanation, decision "
-            "FROM detection_outputs WHERE trace_id = ? ORDER BY step_id ASC",
-            (trace_id,),
-        ).fetchall()
+    with _get_engine().connect() as conn:
+        rows = (
+            conn.execute(
+                select(
+                    detection_outputs_table.c.trace_id,
+                    detection_outputs_table.c.step_id,
+                    detection_outputs_table.c.drift_score,
+                    detection_outputs_table.c.risk_score,
+                    detection_outputs_table.c.provenance_flag,
+                    detection_outputs_table.c.classification,
+                    detection_outputs_table.c.explanation,
+                    detection_outputs_table.c.decision,
+                )
+                .where(detection_outputs_table.c.trace_id == trace_id)
+                .order_by(detection_outputs_table.c.step_id.asc())
+            )
+            .mappings()
+            .fetchall()
+        )
     return [dict(row) for row in rows]
 
 
@@ -423,24 +482,31 @@ def save_detection_output(output: DetectionOutput) -> None:
     Returns nothing. If a result already exists for this
     `(trace_id, step_id)`, it is replaced.
     """
-    with _connect() as conn:
+    upsert_stmt = _upsert(detection_outputs_table).values(
+        trace_id=output.trace_id,
+        step_id=output.step_id,
+        drift_score=output.drift_score,
+        risk_score=output.risk_score,
+        provenance_flag=output.provenance_flag,
+        classification=output.classification,
+        explanation=output.explanation,
+        decision=output.decision,
+        created_at=datetime.now(UTC).isoformat(),
+    )
+    with _get_engine().begin() as conn:
         conn.execute(
-            """
-            INSERT OR REPLACE INTO detection_outputs
-                (trace_id, step_id, drift_score, risk_score, provenance_flag, classification, explanation, decision, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                output.trace_id,
-                output.step_id,
-                output.drift_score,
-                output.risk_score,
-                output.provenance_flag,
-                output.classification,
-                output.explanation,
-                output.decision,
-                datetime.now(UTC).isoformat(),
-            ),
+            upsert_stmt.on_conflict_do_update(
+                index_elements=["trace_id", "step_id"],
+                set_={
+                    "drift_score": upsert_stmt.excluded.drift_score,
+                    "risk_score": upsert_stmt.excluded.risk_score,
+                    "provenance_flag": upsert_stmt.excluded.provenance_flag,
+                    "classification": upsert_stmt.excluded.classification,
+                    "explanation": upsert_stmt.excluded.explanation,
+                    "decision": upsert_stmt.excluded.decision,
+                    "created_at": upsert_stmt.excluded.created_at,
+                },
+            )
         )
 
 
@@ -462,24 +528,30 @@ def get_pending_approvals() -> list[dict]:
     `save_trace`/`append_step` + `save_detection_output`), so every
     genuinely pending row has a matching step to join against.
     """
-    with _connect() as conn:
-        conn.row_factory = sqlite3.Row
-        rows = conn.execute(
-            """
-            SELECT
-                d.trace_id, d.step_id, d.risk_score, d.provenance_flag, d.explanation, d.created_at,
-                d.drift_score, d.classification,
-                s.action, s.action_params, s.input_text
-            FROM detection_outputs d
-            JOIN trace_steps s
-                ON d.trace_id = s.trace_id AND d.step_id = s.step_id
-            LEFT JOIN approval_decisions a
-                ON d.trace_id = a.trace_id AND d.step_id = a.step_id
-            WHERE d.decision = 'approval_required'
-                AND a.trace_id IS NULL
-            ORDER BY d.created_at ASC
-            """
-        ).fetchall()
+    d = detection_outputs_table
+    s = trace_steps_table
+    a = approval_decisions_table
+    query = (
+        select(
+            d.c.trace_id,
+            d.c.step_id,
+            d.c.risk_score,
+            d.c.provenance_flag,
+            d.c.explanation,
+            d.c.created_at,
+            d.c.drift_score,
+            d.c.classification,
+            s.c.action,
+            s.c.action_params,
+            s.c.input_text,
+        )
+        .join(s, and_(d.c.trace_id == s.c.trace_id, d.c.step_id == s.c.step_id))
+        .outerjoin(a, and_(d.c.trace_id == a.c.trace_id, d.c.step_id == a.c.step_id))
+        .where(d.c.decision == "approval_required", a.c.trace_id.is_(None))
+        .order_by(d.c.created_at.asc())
+    )
+    with _get_engine().connect() as conn:
+        rows = conn.execute(query).mappings().fetchall()
     return [{**dict(row), "action_params": json.loads(row["action_params"])} for row in rows]
 
 
@@ -495,10 +567,11 @@ def get_detection_decision(trace_id: str, step_id: int) -> str | None:
     Returns the stored `decision` string (`"block"`, `"approval_required"`,
     or `"allow_logged"`), or `None` if this step was never analyzed at all.
     """
-    with _connect() as conn:
+    with _get_engine().connect() as conn:
         row = conn.execute(
-            "SELECT decision FROM detection_outputs WHERE trace_id = ? AND step_id = ?",
-            (trace_id, step_id),
+            select(detection_outputs_table.c.decision).where(
+                detection_outputs_table.c.trace_id == trace_id, detection_outputs_table.c.step_id == step_id
+            )
         ).fetchone()
     return row[0] if row else None
 
@@ -514,13 +587,21 @@ def get_approval_decision(trace_id: str, step_id: int) -> dict | None:
     Returns a dict with `operator_decision`, `operator_id`, `final_status`,
     and `timestamp`, or `None` if no operator has decided on this step yet.
     """
-    with _connect() as conn:
-        conn.row_factory = sqlite3.Row
-        row = conn.execute(
-            "SELECT operator_decision, operator_id, final_status, timestamp "
-            "FROM approval_decisions WHERE trace_id = ? AND step_id = ?",
-            (trace_id, step_id),
-        ).fetchone()
+    with _get_engine().connect() as conn:
+        row = (
+            conn.execute(
+                select(
+                    approval_decisions_table.c.operator_decision,
+                    approval_decisions_table.c.operator_id,
+                    approval_decisions_table.c.final_status,
+                    approval_decisions_table.c.timestamp,
+                ).where(
+                    approval_decisions_table.c.trace_id == trace_id, approval_decisions_table.c.step_id == step_id
+                )
+            )
+            .mappings()
+            .fetchone()
+        )
     return dict(row) if row else None
 
 
@@ -543,25 +624,31 @@ def save_approval_decision(
       or `"denied_and_blocked"`.
     - `timestamp`: when the decision was made (ISO-8601 string).
 
-    Returns nothing. Raises `sqlite3.IntegrityError` if a decision already
-    exists for this `(trace_id, step_id)` — a plain `INSERT` against the
-    `(trace_id, step_id)` primary key, not `INSERT OR REPLACE`, so that two
-    near-simultaneous calls for the same step can't both "pass" an earlier
-    `get_approval_decision` check and have the second silently overwrite
-    the first (BUG-12): only one commits, and the other gets a real
-    constraint violation to react to. `POST /approval-decision` checks
-    `get_approval_decision` first for the common case (a fast, clean 409
-    without even trying to write), and catches this exception as the
-    fallback for the race the pre-check can't fully close.
+    Returns nothing. Raises `sqlalchemy.exc.IntegrityError` if a decision
+    already exists for this `(trace_id, step_id)` — a plain `INSERT`
+    against the `(trace_id, step_id)` primary key, not an upsert, so that
+    two near-simultaneous calls for the same step can't both "pass" an
+    earlier `get_approval_decision` check and have the second silently
+    overwrite the first (BUG-12): only one commits, and the other gets a
+    real constraint violation to react to — `sqlalchemy.exc.IntegrityError`
+    uniformly wraps the underlying driver's own exception
+    (`sqlite3.IntegrityError`, psycopg's `UniqueViolation`, etc.), so
+    callers don't need to know which backend raised it. `POST
+    /approval-decision` checks `get_approval_decision` first for the
+    common case (a fast, clean 409 without even trying to write), and
+    catches this exception as the fallback for the race the pre-check
+    can't fully close.
     """
-    with _connect() as conn:
+    with _get_engine().begin() as conn:
         conn.execute(
-            """
-            INSERT INTO approval_decisions
-                (trace_id, step_id, operator_decision, operator_id, final_status, timestamp)
-            VALUES (?, ?, ?, ?, ?, ?)
-            """,
-            (trace_id, step_id, operator_decision, operator_id, final_status, timestamp),
+            insert(approval_decisions_table).values(
+                trace_id=trace_id,
+                step_id=step_id,
+                operator_decision=operator_decision,
+                operator_id=operator_id,
+                final_status=final_status,
+                timestamp=timestamp,
+            )
         )
 
 
@@ -579,8 +666,10 @@ def get_cached_llm_value(cache_key: str) -> Any | None:
     a `str` for a judge reply, a `list[float]` for an embedding), or
     `None` if nothing is cached under this key yet.
     """
-    with _connect() as conn:
-        row = conn.execute("SELECT value FROM llm_cache WHERE cache_key = ?", (cache_key,)).fetchone()
+    with _get_engine().connect() as conn:
+        row = conn.execute(
+            select(llm_cache_table.c.value).where(llm_cache_table.c.cache_key == cache_key)
+        ).fetchone()
     return json.loads(row[0]) if row else None
 
 
@@ -598,10 +687,22 @@ def set_cached_llm_value(cache_key: str, model: str, value: Any) -> None:
 
     Returns nothing.
     """
-    with _connect() as conn:
+    upsert_stmt = _upsert(llm_cache_table).values(
+        cache_key=cache_key,
+        model=model,
+        value=json.dumps(value),
+        created_at=datetime.now(UTC).isoformat(),
+    )
+    with _get_engine().begin() as conn:
         conn.execute(
-            "INSERT OR REPLACE INTO llm_cache (cache_key, model, value, created_at) VALUES (?, ?, ?, ?)",
-            (cache_key, model, json.dumps(value), datetime.now(UTC).isoformat()),
+            upsert_stmt.on_conflict_do_update(
+                index_elements=["cache_key"],
+                set_={
+                    "model": upsert_stmt.excluded.model,
+                    "value": upsert_stmt.excluded.value,
+                    "created_at": upsert_stmt.excluded.created_at,
+                },
+            )
         )
 
 
@@ -614,17 +715,21 @@ def create_operator(username: str, password_hash: str) -> int:
     - `username`: the operator's login name. Must be unique.
     - `password_hash`: the bcrypt hash of their password.
 
-    Returns the new operator's `id`. Raises `sqlite3.IntegrityError` if
-    `username` is already taken (`operators.username` is `UNIQUE`) --
+    Returns the new operator's `id`. Raises `sqlalchemy.exc.IntegrityError`
+    if `username` is already taken (`operators.username` is `UNIQUE`) --
     `python -m app.create_operator` turns that into a friendly message.
     """
-    with _connect() as conn:
-        cursor = conn.execute(
-            "INSERT INTO operators (username, password_hash, created_at) VALUES (?, ?, ?)",
-            (username, password_hash, datetime.now(UTC).isoformat()),
+    with _get_engine().begin() as conn:
+        result = conn.execute(
+            insert(operators_table).values(
+                username=username, password_hash=password_hash, created_at=datetime.now(UTC).isoformat()
+            )
         )
-        assert cursor.lastrowid is not None
-        return cursor.lastrowid
+        inserted_primary_key = result.inserted_primary_key
+    assert inserted_primary_key is not None
+    operator_id = inserted_primary_key[0]
+    assert operator_id is not None
+    return operator_id
 
 
 def get_operator_by_username(username: str) -> dict | None:
@@ -637,10 +742,17 @@ def get_operator_by_username(username: str) -> dict | None:
     Returns a dict with `id`, `username`, `password_hash`, `created_at`,
     or `None` if no operator with this username exists.
     """
-    with _connect() as conn:
-        conn.row_factory = sqlite3.Row
-        row = conn.execute(
-            "SELECT id, username, password_hash, created_at FROM operators WHERE username = ?",
-            (username,),
-        ).fetchone()
+    with _get_engine().connect() as conn:
+        row = (
+            conn.execute(
+                select(
+                    operators_table.c.id,
+                    operators_table.c.username,
+                    operators_table.c.password_hash,
+                    operators_table.c.created_at,
+                ).where(operators_table.c.username == username)
+            )
+            .mappings()
+            .fetchone()
+        )
     return dict(row) if row else None

@@ -11,7 +11,7 @@ def _clear_llm_in_memory_cache():
     called) by one test would silently serve a stale hit to a later test
     expecting its own mock to be called. The DB-backed half of the cache
     already resets per-test naturally wherever a test points
-    `config.DATABASE_PATH` at a fresh temp file."""
+    `config.DATABASE_URL` at a fresh temp file."""
     llm.clear_cache()
     yield
     llm.clear_cache()
@@ -50,7 +50,7 @@ def _reset_rate_limiters():
 def auth_headers() -> dict[str, str]:
     """Creates a fresh operator ("test_operator") in the current test's
     temp DB (relies on a `temp_db`-style autouse fixture already pointing
-    `config.DATABASE_PATH` at it -- autouse fixtures run before fixtures a
+    `config.DATABASE_URL` at it -- autouse fixtures run before fixtures a
     test explicitly requests, same scope) and returns an `Authorization`
     header carrying a valid JWT for them -- for tests that need a logged-
     in operator but aren't specifically testing the login flow itself (see

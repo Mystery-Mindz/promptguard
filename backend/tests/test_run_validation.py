@@ -50,7 +50,7 @@ def _mock_llm(monkeypatch, judge_confidence: str, embed_vector: list[float]):
 
 
 def test_limit_caps_how_many_new_traces_run_this_invocation(tmp_path, monkeypatch):
-    monkeypatch.setattr(config, "DATABASE_PATH", str(tmp_path / "test.db"))
+    monkeypatch.setattr(config, "DATABASE_URL", f"sqlite:///{tmp_path / 'test.db'}")
     storage.init_db()
     _mock_llm(monkeypatch, judge_confidence="0.05", embed_vector=[1.0, 0.0])
 
@@ -65,7 +65,7 @@ def test_limit_caps_how_many_new_traces_run_this_invocation(tmp_path, monkeypatc
 
 
 def test_results_file_resumes_without_re_calling_the_model(tmp_path, monkeypatch):
-    monkeypatch.setattr(config, "DATABASE_PATH", str(tmp_path / "test.db"))
+    monkeypatch.setattr(config, "DATABASE_URL", f"sqlite:///{tmp_path / 'test.db'}")
     storage.init_db()
 
     traces_dir = tmp_path / "traces"
@@ -104,7 +104,7 @@ def test_results_file_resumes_without_re_calling_the_model(tmp_path, monkeypatch
 
 
 def test_margin_warning_prints_for_a_thin_risk_score(tmp_path, monkeypatch, capsys):
-    monkeypatch.setattr(config, "DATABASE_PATH", str(tmp_path / "test.db"))
+    monkeypatch.setattr(config, "DATABASE_URL", f"sqlite:///{tmp_path / 'test.db'}")
     storage.init_db()
 
     traces_dir = tmp_path / "traces"

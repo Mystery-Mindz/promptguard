@@ -434,7 +434,7 @@ def _cache_set(model: str, text: str, value: Any) -> None:
 def clear_cache() -> None:
     """Clears the in-memory LRU only. Used by test fixtures for isolation —
     the DB-backed half of the cache already resets naturally since tests
-    point `config.DATABASE_PATH` at a fresh temp file each time; the LRU is
+    point `config.DATABASE_URL` at a fresh temp file each time; the LRU is
     a plain module-level global that would otherwise leak a cached value
     (and its mock-counted call) across tests."""
     _lru.clear()
