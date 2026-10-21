@@ -3,20 +3,24 @@ import secrets
 import sqlite3
 from datetime import UTC, datetime
 
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 
-from app import guard, storage
+from app import config, guard, storage
 from app.agent import run_agent
+from app.auth import AuthenticatedOperator, create_token, require_operator, verify_password
 from app.drift_engine import compute_drift_and_risk
 from app.gate import classification_for, decide, explanation_for_step
 from app.llm import ModelUnavailable
 from app.provenance import get_provenance_flag
+from app.ratelimit import TokenBucketLimiter
 from app.schemas import (
     ApprovalDecisionRequest,
     ApprovalDecisionResponse,
     DetectionOutput,
     FinalStatus,
+    LoginRequest,
+    LoginResponse,
     PendingApproval,
     RunAgentRequest,
     Trace,
@@ -30,11 +34,15 @@ app = FastAPI(title="PromptGuard")
 #    as two separate processes, and the port can vary)
 #  - any *.streamlit.app subdomain over HTTPS (Streamlit Cloud, where the
 #    deployed frontend actually lives — a real internet URL, not localhost)
-# Anchored at both ends so this can't be satisfied by, e.g., a domain that
-# merely contains "streamlit.app" as a substring (https://streamlit.app.evil.com).
+#  - any exact origin listed in config.EXTRA_CORS_ORIGINS (Prompt 4.1) —
+#    e.g. a custom domain that isn't localhost or *.streamlit.app.
+# The regex is anchored at both ends so it can't be satisfied by, e.g., a
+# domain that merely contains "streamlit.app" as a substring
+# (https://streamlit.app.evil.com).
 app.add_middleware(
     CORSMiddleware,
     allow_origin_regex=r"^https?://(localhost|127\.0\.0\.1):\d+$|^https://([a-zA-Z0-9-]+\.)*streamlit\.app$",
+    allow_origins=config.EXTRA_CORS_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -42,6 +50,17 @@ app.add_middleware(
 
 storage.init_db()
 app.include_router(guard.router)
+
+# Rate limiting (Prompt 4.1, fixes BUG-06) — keyed by client IP, since
+# there's no authenticated identity yet at the point someone is trying to
+# log in. See config.RATE_LIMIT_AUTH_LOGIN_* for the budget.
+_login_limiter = TokenBucketLimiter(config.RATE_LIMIT_AUTH_LOGIN_CAPACITY, config.RATE_LIMIT_AUTH_LOGIN_REFILL_PER_SECOND)
+
+
+def _rate_limit_login(request: Request) -> None:
+    client_ip = request.client.host if request.client else "unknown"
+    if not _login_limiter.allow(client_ip):
+        raise HTTPException(status_code=429, detail="Too many login attempts; wait a few minutes and try again.")
 
 
 @app.get("/health")
@@ -54,6 +73,32 @@ def health_endpoint() -> dict[str, str]:
     Takes no parameters. Returns `{"status": "ok"}` with HTTP 200.
     """
     return {"status": "ok"}
+
+
+@app.post("/auth/login", response_model=LoginResponse)
+def login_endpoint(request: LoginRequest, _rate_limit: None = Depends(_rate_limit_login)) -> LoginResponse:
+    """API endpoint: `POST /auth/login` (Prompt 4.1, fixes BUG-06).
+    Exchanges an operator's username/password for a signed JWT. Create an
+    operator account first via `python -m app.create_operator <username>`.
+
+    Parameters (request body, see `LoginRequest`):
+    - `username`, `password`: the operator's credentials.
+
+    Returns a `LoginResponse`: `token` (send as `Authorization: Bearer
+    <token>` to `GET /pending-approvals` and `POST /approval-decision`,
+    valid for `config.JWT_EXPIRY_HOURS` hours) and `operator_id` (the
+    operator's username — the identity the token itself carries). Responds
+    with 401 for an unknown username or wrong password (the same message
+    either way, so a failed login can't be used to enumerate valid
+    usernames), or 429 if this client IP has made too many recent attempts
+    (`config.RATE_LIMIT_AUTH_LOGIN_*`).
+    """
+    operator = storage.get_operator_by_username(request.username)
+    if operator is None or not verify_password(request.password, operator["password_hash"]):
+        raise HTTPException(status_code=401, detail="Invalid username or password.")
+
+    token = create_token(operator["id"], operator["username"])
+    return LoginResponse(token=token, operator_id=operator["username"])
 
 
 def _generate_trace_id() -> str:
@@ -184,18 +229,24 @@ def get_trace_endpoint(trace_id: str) -> TraceWithDetections:
 
 
 @app.get("/pending-approvals", response_model=list[PendingApproval])
-def pending_approvals_endpoint() -> list[PendingApproval]:
+def pending_approvals_endpoint(
+    operator: AuthenticatedOperator = Depends(require_operator),  # noqa: B008 -- idiomatic FastAPI DI, not a mutable default
+) -> list[PendingApproval]:
     """API endpoint: `GET /pending-approvals`. Lets the Operator Approval
     Console poll for real work — every step currently awaiting a human
     decision.
 
-    Takes no parameters. Returns a list of `PendingApproval` (oldest
-    first): every step flagged `approval_required` by `/analyze-trace` or a
-    live `/guard/check` that hasn't been approved or denied yet. Carries
-    `action`, `action_params`, `input_text`, `drift_score`, and
-    `classification` (added for Prompt 3.1, additive to the existing
-    fields) so the Operator Approval Console can show what is actually
-    being approved, not just its score.
+    Requires `Authorization: Bearer <jwt>` (Prompt 4.1, fixes BUG-06) —
+    401 if missing/invalid/expired. `operator` itself isn't used by this
+    read-only endpoint; the dependency exists purely to gate access to who
+    gets to see the queue at all, not to filter it per-operator.
+
+    Returns a list of `PendingApproval` (oldest first): every step flagged
+    `approval_required` by `/analyze-trace` or a live `/guard/check` that
+    hasn't been approved or denied yet. Carries `action`, `action_params`,
+    `input_text`, `drift_score`, and `classification` (added for Prompt
+    3.1, additive to the existing fields) so the Operator Approval Console
+    can show what is actually being approved, not just its score.
     """
     return [
         PendingApproval(
@@ -239,18 +290,28 @@ def _already_decided_error(trace_id: str, step_id: int, existing_decision: dict)
 
 
 @app.post("/approval-decision", response_model=ApprovalDecisionResponse)
-def approval_decision_endpoint(request: ApprovalDecisionRequest) -> ApprovalDecisionResponse:
+def approval_decision_endpoint(
+    request: ApprovalDecisionRequest,
+    operator: AuthenticatedOperator = Depends(require_operator),  # noqa: B008 -- idiomatic FastAPI DI
+) -> ApprovalDecisionResponse:
     """API endpoint: `POST /approval-decision`. Records a human operator's
     approve/deny call on a step that PromptGuard flagged for review. This
-    decision must come from the request body (a real human action on a
-    separate, authenticated channel) — never derived from the trace's own
-    content, to avoid a "confused deputy" bug where flagged content could
-    approve itself.
+    decision must come from a real human action on a separate,
+    authenticated channel — never derived from the trace's own content, to
+    avoid a "confused deputy" bug where flagged content could approve
+    itself.
+
+    Requires `Authorization: Bearer <jwt>` (Prompt 4.1, fixes BUG-06) —
+    401 if missing/invalid/expired. The recorded `operator_id` is taken
+    from this token (`operator.operator_id`), never from the request body
+    — same "never derive identity from something an attacker could shape"
+    principle CLAUDE.md states for `input_text`.
 
     Parameters (request body, see `ApprovalDecisionRequest`):
     - `trace_id`, `step_id`: which step is being decided on.
     - `operator_decision`: `"approved"` or `"denied"`.
-    - `operator_id`: optional identifier for who decided.
+    - `operator_id`: accepted for contract compatibility, but IGNORED —
+      the real identity comes from the token, not the body.
 
     Returns an `ApprovalDecisionResponse` with the resulting `final_status`
     (`"approved_and_allowed"` or `"denied_and_blocked"`) and a timestamp.
@@ -285,7 +346,7 @@ def approval_decision_endpoint(request: ApprovalDecisionRequest) -> ApprovalDeci
             trace_id=request.trace_id,
             step_id=request.step_id,
             operator_decision=request.operator_decision,
-            operator_id=request.operator_id,
+            operator_id=operator.operator_id,
             final_status=final_status,
             timestamp=timestamp.isoformat(),
         )

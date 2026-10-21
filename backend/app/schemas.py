@@ -43,6 +43,16 @@ class DetectionOutput(BaseModel):
     decision: Decision
 
 
+class LoginRequest(BaseModel):
+    username: str
+    password: str
+
+
+class LoginResponse(BaseModel):
+    token: str
+    operator_id: str
+
+
 class RunAgentRequest(BaseModel):
     original_goal: str
     # None means "generate a fresh unique trace_id" (see
