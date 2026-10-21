@@ -11,9 +11,13 @@
 # the Prompt 2.1 provider layer (app/llm.py), it's now also a direct
 # dependency (retry/backoff on 429/503) — no version bump needed, just
 # noting it's no longer "only" transitive.
+#
+# bcrypt and PyJWT added for Prompt 4.1 (app/auth.py): bcrypt hashes
+# operator passwords, PyJWT signs/verifies the operator login token.
 annotated-doc==0.0.5
 annotated-types==0.8.0
 anyio==4.15.1
+bcrypt==5.0.0
 certifi==2026.7.22
 cffi==2.1.1
 charset-normalizer==3.5.1
@@ -39,6 +43,7 @@ pycparser==3.0
 pydantic==2.13.5
 pydantic_core==2.46.5
 Pygments==2.21.0
+PyJWT==2.15.1
 pytest==9.1.1
 python-dotenv==1.2.3
 PyYAML==6.0.3

@@ -55,12 +55,13 @@ def _seed(trace_id: str, step_id: int, decision: str) -> None:
     )
 
 
-def test_approval_decision_succeeds_for_flagged_step():
+def test_approval_decision_succeeds_for_flagged_step(auth_headers):
     _seed("trace_test", 1, "approval_required")
 
     response = client.post(
         "/approval-decision",
-        json={"trace_id": "trace_test", "step_id": 1, "operator_decision": "approved", "operator_id": "reviewer_1"},
+        json={"trace_id": "trace_test", "step_id": 1, "operator_decision": "approved"},
+        headers=auth_headers,
     )
 
     assert response.status_code == 200
@@ -70,64 +71,108 @@ def test_approval_decision_succeeds_for_flagged_step():
     assert body["final_status"] == "approved_and_allowed"
 
 
-def test_approval_decision_rejects_second_call_on_already_decided_step():
+def test_approval_decision_requires_bearer_auth():
+    _seed("trace_test", 50, "approval_required")
+
+    response = client.post(
+        "/approval-decision",
+        json={"trace_id": "trace_test", "step_id": 50, "operator_decision": "approved"},
+    )
+
+    assert response.status_code == 401
+
+
+def test_approval_decision_ignores_body_operator_id_uses_token_identity(auth_headers):
+    """Prompt 4.1: a body operator_id is accepted for contract
+    compatibility but IGNORED -- the real identity always comes from the
+    verified JWT (`auth_headers`'s "test_operator"), never from anything
+    the caller could put in the request body."""
+    _seed("trace_test", 51, "approval_required")
+
+    response = client.post(
+        "/approval-decision",
+        json={
+            "trace_id": "trace_test",
+            "step_id": 51,
+            "operator_decision": "approved",
+            "operator_id": "someone_else_entirely",
+        },
+        headers=auth_headers,
+    )
+
+    assert response.status_code == 200
+    recorded = storage.get_approval_decision("trace_test", 51)
+    assert recorded["operator_id"] == "test_operator"
+
+
+def test_approval_decision_rejects_second_call_on_already_decided_step(auth_headers):
     _seed("trace_test", 99, "approval_required")
 
     first_response = client.post(
         "/approval-decision",
-        json={"trace_id": "trace_test", "step_id": 99, "operator_decision": "approved", "operator_id": "reviewer_1"},
+        json={"trace_id": "trace_test", "step_id": 99, "operator_decision": "approved"},
+        headers=auth_headers,
     )
     assert first_response.status_code == 200
 
     second_response = client.post(
         "/approval-decision",
-        json={"trace_id": "trace_test", "step_id": 99, "operator_decision": "denied", "operator_id": "reviewer_2"},
+        json={"trace_id": "trace_test", "step_id": 99, "operator_decision": "denied"},
+        headers=auth_headers,
     )
 
     assert second_response.status_code == 409
     detail = second_response.json()["detail"]
-    assert "reviewer_1" in detail
+    assert "test_operator" in detail
     assert "approved" in detail
 
     # Confirm the original decision was NOT overwritten by the rejected second call.
     unchanged = storage.get_approval_decision("trace_test", 99)
     assert unchanged["operator_decision"] == "approved"
-    assert unchanged["operator_id"] == "reviewer_1"
+    assert unchanged["operator_id"] == "test_operator"
 
 
-def test_approval_decision_denied_maps_to_denied_and_blocked():
+def test_approval_decision_denied_maps_to_denied_and_blocked(auth_headers):
     _seed("trace_test", 2, "approval_required")
 
     response = client.post(
         "/approval-decision",
         json={"trace_id": "trace_test", "step_id": 2, "operator_decision": "denied"},
+        headers=auth_headers,
     )
 
     assert response.status_code == 200
     assert response.json()["final_status"] == "denied_and_blocked"
 
 
-def test_approval_decision_rejects_step_never_analyzed():
+def test_approval_decision_rejects_step_never_analyzed(auth_headers):
     response = client.post(
         "/approval-decision",
         json={"trace_id": "nonexistent_trace", "step_id": 1, "operator_decision": "approved"},
+        headers=auth_headers,
     )
 
     assert response.status_code == 404
 
 
-def test_approval_decision_rejects_step_not_flagged_approval_required():
+def test_approval_decision_rejects_step_not_flagged_approval_required(auth_headers):
     _seed("trace_test", 3, "allow_logged")
 
     response = client.post(
         "/approval-decision",
         json={"trace_id": "trace_test", "step_id": 3, "operator_decision": "approved"},
+        headers=auth_headers,
     )
 
     assert response.status_code == 409
 
 
-def test_pending_approvals_returns_correct_records_and_excludes_decided_ones():
+def test_pending_approvals_requires_bearer_auth():
+    response = client.get("/pending-approvals")
+    assert response.status_code == 401
+
+
+def test_pending_approvals_returns_correct_records_and_excludes_decided_ones(auth_headers):
     _seed("trace_pending", 1, "approval_required")  # genuinely pending — should be returned
     _seed("trace_pending", 2, "allow_logged")  # wrong decision — should be excluded
     _seed("trace_decided", 1, "approval_required")  # already decided — should be excluded
@@ -141,7 +186,7 @@ def test_pending_approvals_returns_correct_records_and_excludes_decided_ones():
         timestamp="2026-01-01T00:00:00+00:00",
     )
 
-    response = client.get("/pending-approvals")
+    response = client.get("/pending-approvals", headers=auth_headers)
 
     assert response.status_code == 200
     body = response.json()
@@ -420,3 +465,58 @@ def test_analyze_trace_batches_embeddings_across_the_whole_trace():
     # Total model calls for this trace: 1 (embed_many) + 3 (judge) = 4,
     # down from 9 (6 embed calls + 3 judge calls) before batching.
     assert mock_embed_many.call_count + mock_judge.call_count == 4
+
+
+# --- CORS (Prompt 4.1): EXTRA_CORS_ORIGINS is additive to the existing ----
+# allow_origin_regex, not a replacement for it. app.main.app is already
+# built at import time with whatever EXTRA_CORS_ORIGINS was then (empty,
+# in every test run here) -- monkeypatching config.EXTRA_CORS_ORIGINS
+# afterward wouldn't reach that already-constructed middleware, so this
+# builds a second, throwaway app with the exact same CORSMiddleware call
+# main.py makes, to verify allow_origin_regex and allow_origins really do
+# combine (both accepted, not one overriding the other).
+
+
+def _cors_test_client(extra_origins: list[str]) -> TestClient:
+    from fastapi import FastAPI
+    from fastapi.middleware.cors import CORSMiddleware
+
+    probe_app = FastAPI()
+    probe_app.add_middleware(
+        CORSMiddleware,
+        allow_origin_regex=r"^https?://(localhost|127\.0\.0\.1):\d+$|^https://([a-zA-Z0-9-]+\.)*streamlit\.app$",
+        allow_origins=extra_origins,
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+
+    @probe_app.get("/health")
+    def _health():
+        return {"status": "ok"}
+
+    return TestClient(probe_app)
+
+
+def test_cors_regex_origin_still_allowed_alongside_extra_origins():
+    probe = _cors_test_client(["https://partner.example"])
+    response = probe.get("/health", headers={"Origin": "http://localhost:8501"})
+    assert response.headers.get("access-control-allow-origin") == "http://localhost:8501"
+
+
+def test_cors_extra_origin_is_allowed():
+    probe = _cors_test_client(["https://partner.example"])
+    response = probe.get("/health", headers={"Origin": "https://partner.example"})
+    assert response.headers.get("access-control-allow-origin") == "https://partner.example"
+
+
+def test_cors_unrelated_origin_is_not_allowed():
+    probe = _cors_test_client(["https://partner.example"])
+    response = probe.get("/health", headers={"Origin": "https://evil.example"})
+    assert "access-control-allow-origin" not in response.headers
+
+
+def test_cors_no_extra_origins_configured_regex_still_works():
+    probe = _cors_test_client([])
+    response = probe.get("/health", headers={"Origin": "http://127.0.0.1:8502"})
+    assert response.headers.get("access-control-allow-origin") == "http://127.0.0.1:8502"

@@ -186,3 +186,72 @@ DEFAULT_PACING_SECONDS = 5.0
 # storage.py) has no size cap and is the source of truth across process
 # restarts — the LRU is just a fast, in-process front for it.
 LLM_CACHE_MAX_ENTRIES = 1000
+
+# --- Operator auth (app/auth.py) -- Prompt 4.1, fixes BUG-06 ---------------
+#
+# JWT_SECRET signs/verifies the operator login token POST /auth/login
+# issues. Same fail-fast-at-import pattern as GEMINI_API_KEY above (never
+# hardcode a secret; missing it is a startup error, not a silent fallback)
+# -- except there's no .env fallback distinction to make here (no platform
+# env var could ever legitimately collide with a local .env value the way
+# BUG-14 did for GEMINI_API_KEY), so this is a plain required env var.
+# Wrapped in its own function (like _resolve_gemini_api_key above) so
+# test_config.py can exercise the fail-fast behavior directly, without
+# needing to re-import this whole module under different env vars.
+
+
+def _resolve_jwt_secret() -> str:
+    jwt_secret = os.getenv("JWT_SECRET") or ""
+    if not jwt_secret:
+        raise RuntimeError(
+            "JWT_SECRET is not set. Set it in backend/.env (JWT_SECRET=...) or export it in your "
+            "shell/deployment platform before starting the app -- it signs operator login tokens."
+        )
+    return jwt_secret
+
+
+JWT_SECRET = _resolve_jwt_secret()
+JWT_EXPIRY_HOURS = 8
+
+# --- /guard/* API keys (app/guard.py) -- Prompt 4.1, fixes BUG-06 ----------
+#
+# Every /guard/* route requires X-PromptGuard-Key to match one of these
+# (comma-separated in the env var; whitespace around each key is
+# stripped). Required, same fail-fast reasoning as JWT_SECRET above -- an
+# empty set would make every /guard/* call unauthenticatable rather than
+# accidentally open.
+
+
+def _resolve_promptguard_api_keys() -> set[str]:
+    raw = os.getenv("PROMPTGUARD_API_KEYS") or ""
+    keys = {key.strip() for key in raw.split(",") if key.strip()}
+    if not keys:
+        raise RuntimeError(
+            "PROMPTGUARD_API_KEYS is not set (comma-separated X-PromptGuard-Key values). Set it in "
+            "backend/.env or export it in your shell/deployment platform before starting the app."
+        )
+    return keys
+
+
+PROMPTGUARD_API_KEYS = _resolve_promptguard_api_keys()
+
+# --- Rate limiting (app/ratelimit.py) -- Prompt 4.1, fixes BUG-06 ---------
+#
+# A simple in-process token bucket per caller (see app/ratelimit.py):
+# `*_CAPACITY` tokens available immediately (the burst size), refilling at
+# `*_REFILL_PER_SECOND` tokens/sec after that. /guard/check is keyed by the
+# caller's validated X-PromptGuard-Key; /auth/login (no key available
+# before a successful login) is keyed by client IP, with a much smaller
+# budget to slow down password-guessing.
+RATE_LIMIT_GUARD_CHECK_CAPACITY = 20.0
+RATE_LIMIT_GUARD_CHECK_REFILL_PER_SECOND = 20.0 / 60.0  # ~20/minute steady-state, bursts up to 20
+RATE_LIMIT_AUTH_LOGIN_CAPACITY = 5.0
+RATE_LIMIT_AUTH_LOGIN_REFILL_PER_SECOND = 5.0 / 300.0  # ~5 attempts per 5 minutes per IP
+
+# --- CORS (app/main.py) -- Prompt 4.1 ---------------------------------------
+#
+# Additive to main.py's existing allow_origin_regex (localhost/127.0.0.1,
+# any port, plus *.streamlit.app) -- an exact-match allowlist for any other
+# origin (e.g. a custom domain) that needs to call this API. Comma-
+# separated in the env var; empty by default (no extra origins).
+EXTRA_CORS_ORIGINS = [origin.strip() for origin in (os.getenv("EXTRA_CORS_ORIGINS") or "").split(",") if origin.strip()]

@@ -1,5 +1,14 @@
 # Person 3 (Joshwa) — Interfaces + Deployment · HEAVY
 
+> **Note from P1 (Aadhira), 2026-10-21, Prompt 4.1 (fixes BUG-06) — `/auth/login` is live, action needed on your side:**
+>
+> - `POST /auth/login` is real now: `{username, password}` → `{token, operator_id}` (JWT, PyJWT, `HS256`, 8h expiry). Create an account with `python -m app.create_operator <username>` (prompts for a password; ask me if you want me to create one for you, or run it yourself against the shared DB).
+> - **`GET /pending-approvals` and `POST /approval-decision` now require `Authorization: Bearer <jwt>` — they 401 without it.** The Operator Approval Console needs to call `/auth/login` first (e.g. on its own login screen) and send the returned token as that header on every `/pending-approvals`/`/approval-decision` call from then on.
+> - `operator_id` in the `/approval-decision` request body is still accepted (so you don't have to rush removing it) but is now **ignored** — the real identity is always taken from the Bearer token. Don't rely on the body field for anything; the token's `operator_id` (in the login response) is the one that actually gets recorded.
+> - **TODO for you, once the console sends the Bearer header:** remove the hardcoded `APPROVAL_TOKEN` default (and the whole demo-token check) from `frontend/config.py` — it's a leftover from before real auth existed (BUG-06) and shouldn't ship alongside it. I did not touch `frontend/` myself; this is explicitly your call on timing/approach.
+> - Separately: every `/guard/*` route (not frontend-facing today, but relevant once your console or P2's assistant calls it directly) now requires `X-PromptGuard-Key` matching one of `PROMPTGUARD_API_KEYS` — the `promptguard_client` SDK already sends this via its `api_key` constructor argument, no SDK change needed.
+> - Full details: `backend/CLAUDE.md`'s "Operator auth" and `/guard/*` sections. Ping me if anything here is unclear.
+
 **You own:** everything in `frontend/` (chat app, attacker form, activity dashboard, approval console) and every deployment (Render, Neon, Streamlit Cloud, GitHub Pages, uptime pings, smoke test).
 **You depend on:** P2's mock `/chat` (Wed evening), P1's `/guard/sessions` (Thu) and `/auth/login` (Fri). Build against mocks until then.
 

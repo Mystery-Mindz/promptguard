@@ -126,6 +126,17 @@ def init_db() -> None:
             """
         )
 
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS operators (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                username TEXT NOT NULL UNIQUE,
+                password_hash TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            )
+            """
+        )
+
 
 def _delete_trace_rows(conn: sqlite3.Connection, trace_id: str) -> None:
     """Deletes every row derived from a trace_id across `trace_steps`,
@@ -592,3 +603,44 @@ def set_cached_llm_value(cache_key: str, model: str, value: Any) -> None:
             "INSERT OR REPLACE INTO llm_cache (cache_key, model, value, created_at) VALUES (?, ?, ?, ?)",
             (cache_key, model, json.dumps(value), datetime.now(UTC).isoformat()),
         )
+
+
+def create_operator(username: str, password_hash: str) -> int:
+    """Inserts a new operator account into the `operators` table. See
+    `app.auth.hash_password` for producing `password_hash` -- this
+    function never hashes a plaintext password itself.
+
+    Parameters:
+    - `username`: the operator's login name. Must be unique.
+    - `password_hash`: the bcrypt hash of their password.
+
+    Returns the new operator's `id`. Raises `sqlite3.IntegrityError` if
+    `username` is already taken (`operators.username` is `UNIQUE`) --
+    `python -m app.create_operator` turns that into a friendly message.
+    """
+    with _connect() as conn:
+        cursor = conn.execute(
+            "INSERT INTO operators (username, password_hash, created_at) VALUES (?, ?, ?)",
+            (username, password_hash, datetime.now(UTC).isoformat()),
+        )
+        assert cursor.lastrowid is not None
+        return cursor.lastrowid
+
+
+def get_operator_by_username(username: str) -> dict | None:
+    """Looks up an operator account by username, for `POST /auth/login`
+    to verify a password against.
+
+    Parameters:
+    - `username`: the login name to look up.
+
+    Returns a dict with `id`, `username`, `password_hash`, `created_at`,
+    or `None` if no operator with this username exists.
+    """
+    with _connect() as conn:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute(
+            "SELECT id, username, password_hash, created_at FROM operators WHERE username = ?",
+            (username,),
+        ).fetchone()
+    return dict(row) if row else None

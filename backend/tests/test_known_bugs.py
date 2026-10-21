@@ -69,7 +69,7 @@ def test_bug01_reanalysis_replaces_old_steps():
     assert [s.action for s in stored.steps] == ["read_email", "delete_file"]
 
 
-def test_bug01_new_flagged_step_does_not_inherit_an_old_approval():
+def test_bug01_new_flagged_step_does_not_inherit_an_old_approval(auth_headers):
     trace = {
         "trace_id": "reused_id",
         "agent_id": "agent_A",
@@ -89,8 +89,8 @@ def test_bug01_new_flagged_step_does_not_inherit_an_old_approval():
     }
     with patch("app.main.compute_drift_and_risk", return_value=(0.5, 60)):
         assert client.post("/analyze-trace", json=trace).status_code == 200
-    approve = {"trace_id": "reused_id", "step_id": 1, "operator_decision": "approved", "operator_id": "op"}
-    assert client.post("/approval-decision", json=approve).status_code == 200
+    approve = {"trace_id": "reused_id", "step_id": 1, "operator_decision": "approved"}
+    assert client.post("/approval-decision", json=approve, headers=auth_headers).status_code == 200
 
     # Same trace_id, a completely different (dangerous) step 1 — e.g. a second
     # /run-agent call using the default trace_id.
@@ -99,7 +99,7 @@ def test_bug01_new_flagged_step_does_not_inherit_an_old_approval():
     with patch("app.main.compute_drift_and_risk", return_value=(0.5, 60)):
         assert client.post("/analyze-trace", json=trace).status_code == 200
 
-    pending = client.get("/pending-approvals").json()
+    pending = client.get("/pending-approvals", headers=auth_headers).json()
     assert any(p["trace_id"] == "reused_id" and p["step_id"] == 1 for p in pending), (
         "the new delete_file step is silently treated as already approved"
     )
@@ -288,7 +288,7 @@ def test_bug08_parallel_function_calls_get_one_combined_function_response_turn()
 # --- BUG-12: approval decisions race on INSERT OR REPLACE -------------------
 
 
-def test_bug12_concurrent_approval_decisions_do_not_silently_overwrite():
+def test_bug12_concurrent_approval_decisions_do_not_silently_overwrite(auth_headers):
     """Simulates two near-simultaneous /approval-decision calls for the same
     (trace_id, step_id): both pass the "already decided?" pre-check before
     either has written (the TOCTOU window), but only one write can win --
@@ -335,8 +335,8 @@ def test_bug12_concurrent_approval_decisions_do_not_silently_overwrite():
                 "trace_id": trace_id,
                 "step_id": step_id,
                 "operator_decision": "denied",
-                "operator_id": "second_operator",
             },
+            headers=auth_headers,
         )
 
     assert response.status_code == 409, response.text

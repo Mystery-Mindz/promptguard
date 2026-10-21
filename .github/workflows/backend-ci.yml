@@ -51,6 +51,10 @@ jobs:
           # client, it fails fast on a bad key instead of making a live
           # network call (and incurring cost) in CI.
           GEMINI_API_KEY: "ci-placeholder-not-a-real-key"
+          # app/config.py fails fast at import time if either is unset
+          # (Prompt 4.1) — placeholders only, never real secrets.
+          JWT_SECRET: "ci-placeholder-jwt-secret-not-for-real-use"
+          PROMPTGUARD_API_KEYS: "ci-placeholder-guard-key"
         run: pytest tests/ -v
 
   sdk-test:

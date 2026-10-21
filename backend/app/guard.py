@@ -9,6 +9,11 @@ drift+judge+provenance+gate pipeline (Prompt 3.1) — the same pipeline
 `storage.append_step`, and each `/guard/observe`/`/guard/check` call scores
 ONLY the new step, against the session's accumulated history so far.
 Any other `GUARD_MODE` value is a misconfiguration (`HTTPException(500)`).
+
+Every route on `router` requires `X-PromptGuard-Key` (Prompt 4.1, fixes
+BUG-06), enforced once via `require_api_key` as a router-level dependency
+rather than repeated in each route. `/guard/check` is additionally rate-
+limited per validated key (`config.RATE_LIMIT_GUARD_CHECK_*`).
 """
 
 import logging
@@ -18,13 +23,14 @@ import time
 from datetime import UTC, datetime
 from typing import Literal
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, Header, HTTPException
 
 from app import config, storage
 from app.drift_engine import compute_drift_and_risk
 from app.gate import classification_for, decide, explanation_for_step
 from app.llm import ModelUnavailable
 from app.provenance import get_provenance_flag
+from app.ratelimit import TokenBucketLimiter
 from app.schemas import (
     Decision,
     DetectionOutput,
@@ -42,10 +48,35 @@ from app.schemas import (
     TraceWithDetections,
 )
 
-router = APIRouter(prefix="/guard", tags=["guard"])
+
+def require_api_key(x_promptguard_key: str | None = Header(default=None, alias="X-PromptGuard-Key")) -> str:
+    """FastAPI dependency, applied to every `/guard/*` route via
+    `router`'s `dependencies=`: requires `X-PromptGuard-Key` to match one
+    of `config.PROMPTGUARD_API_KEYS`. Raises `HTTPException(401)`
+    otherwise. Returns the validated key itself, so a route that also
+    needs it (`check`, for rate limiting) can depend on this function
+    again without re-validating — FastAPI caches a dependency's result
+    per request by default.
+    """
+    if not x_promptguard_key or x_promptguard_key not in config.PROMPTGUARD_API_KEYS:
+        raise HTTPException(status_code=401, detail="Missing or invalid X-PromptGuard-Key header.")
+    return x_promptguard_key
+
+
+router = APIRouter(prefix="/guard", tags=["guard"], dependencies=[Depends(require_api_key)])
 logger = logging.getLogger(__name__)
 
 GuardMode = Literal["mock", "live"]
+
+# Rate limiting (Prompt 4.1, fixes BUG-06) — keyed by the caller's
+# validated X-PromptGuard-Key. See config.RATE_LIMIT_GUARD_CHECK_* for the
+# budget.
+_check_limiter = TokenBucketLimiter(config.RATE_LIMIT_GUARD_CHECK_CAPACITY, config.RATE_LIMIT_GUARD_CHECK_REFILL_PER_SECOND)
+
+
+def _rate_limit_check(api_key: str = Depends(require_api_key)) -> None:
+    if not _check_limiter.allow(api_key):
+        raise HTTPException(status_code=429, detail="Rate limit exceeded for /guard/check; slow down.")
 
 # Deterministic mock-mode scoring rules (no LLM calls) — see Prompt 1.3 in
 # docs/plan/P1_core_backend.md for the exact spec. The destructive-action
@@ -283,7 +314,7 @@ def observe(request: GuardObserveRequest) -> DetectionOutput:
 
 
 @router.post("/check", response_model=GuardCheckResponse)
-def check(request: GuardCheckRequest) -> GuardCheckResponse:
+def check(request: GuardCheckRequest, _rate_limit: None = Depends(_rate_limit_check)) -> GuardCheckResponse:
     """API endpoint: `POST /guard/check`. Scores a tool call the agent is
     ABOUT to make — call this BEFORE actually running the tool, and only
     run it if the response says to.
@@ -293,6 +324,10 @@ def check(request: GuardCheckRequest) -> GuardCheckResponse:
     - `actor`, `input_text`, `input_source`, `input_provenance`: same
       meaning as the shared trace step schema.
     - `action`, `action_params`: the tool call being considered.
+
+    Rate-limited per validated `X-PromptGuard-Key` (Prompt 4.1,
+    `config.RATE_LIMIT_GUARD_CHECK_*`) — `HTTPException(429)` once a
+    caller's burst budget is exhausted.
 
     Returns a `GuardCheckResponse` (a `DetectionOutput` plus
     `approval_status`: `"pending"` if `decision == "approval_required"`
