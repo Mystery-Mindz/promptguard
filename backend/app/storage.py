@@ -439,17 +439,29 @@ def get_pending_approvals() -> list[dict]:
 
     Takes no parameters. Returns a list of dicts (one per pending step,
     oldest first), each with `trace_id`, `step_id`, `risk_score`,
-    `provenance_flag`, `explanation`, and `created_at` — every step whose
-    stored `decision` is `"approval_required"` and that has no matching row
-    in `approval_decisions` yet (i.e. genuinely still undecided; anything
-    already approved or denied is excluded).
+    `provenance_flag`, `explanation`, `created_at`, and (added for Prompt
+    3.1, joined in from `trace_steps`/`detection_outputs`) `action`,
+    `action_params` (parsed back into a dict), `input_text`, `drift_score`,
+    `classification` — every step whose stored `decision` is
+    `"approval_required"` and that has no matching row in
+    `approval_decisions` yet (i.e. genuinely still undecided; anything
+    already approved or denied is excluded). Joined against `trace_steps`
+    on `(trace_id, step_id)` — both `/analyze-trace` and `/guard/*` always
+    write a trace_steps row together with its detection_outputs row (see
+    `save_trace`/`append_step` + `save_detection_output`), so every
+    genuinely pending row has a matching step to join against.
     """
     with _connect() as conn:
         conn.row_factory = sqlite3.Row
         rows = conn.execute(
             """
-            SELECT d.trace_id, d.step_id, d.risk_score, d.provenance_flag, d.explanation, d.created_at
+            SELECT
+                d.trace_id, d.step_id, d.risk_score, d.provenance_flag, d.explanation, d.created_at,
+                d.drift_score, d.classification,
+                s.action, s.action_params, s.input_text
             FROM detection_outputs d
+            JOIN trace_steps s
+                ON d.trace_id = s.trace_id AND d.step_id = s.step_id
             LEFT JOIN approval_decisions a
                 ON d.trace_id = a.trace_id AND d.step_id = a.step_id
             WHERE d.decision = 'approval_required'
@@ -457,7 +469,7 @@ def get_pending_approvals() -> list[dict]:
             ORDER BY d.created_at ASC
             """
         ).fetchall()
-    return [dict(row) for row in rows]
+    return [{**dict(row), "action_params": json.loads(row["action_params"])} for row in rows]
 
 
 def get_detection_decision(trace_id: str, step_id: int) -> str | None:

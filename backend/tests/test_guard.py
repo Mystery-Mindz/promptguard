@@ -1,10 +1,17 @@
-"""Tests for the /guard/* contract in GUARD_MODE=mock (Prompt 1.3, see
-docs/plan/P1_core_backend.md and docs/plan/00_OVERVIEW.md section A)."""
+"""Tests for the /guard/* contract, in both GUARD_MODE=mock (Prompt 1.3,
+see docs/plan/P1_core_backend.md and docs/plan/00_OVERVIEW.md section A)
+and the real live-pipeline mode (GUARD_MODE unset or "live", Prompt 3.1).
+Live-mode tests mock app.llm.embed_many/judge (same boundary every other
+test in this repo mocks at) -- no live model calls are made anywhere in
+this file."""
+
+from unittest.mock import patch
 
 import pytest
 from fastapi.testclient import TestClient
 
 from app import config, storage
+from app.llm import ModelUnavailable
 from app.main import app
 
 client = TestClient(app)
@@ -224,8 +231,154 @@ def test_list_sessions_summarizes_recent_sessions():
     assert summary["worst_decision"] == "approval_required"
 
 
-def test_guard_endpoints_501_when_guard_mode_is_not_mock(monkeypatch):
-    monkeypatch.delenv("GUARD_MODE", raising=False)
+def test_guard_endpoints_500_on_invalid_guard_mode_value(monkeypatch):
+    monkeypatch.setenv("GUARD_MODE", "not_a_real_mode")
     response = client.post("/guard/session", json={"agent_id": "agent_A", "original_goal": "g"})
-    assert response.status_code == 501
+    assert response.status_code == 500
     assert "detail" in response.json()
+
+
+# --- Live mode (GUARD_MODE unset or "live", Prompt 3.1) --------------------
+#
+# These reuse the same real drift+judge+provenance+gate pipeline
+# /analyze-trace runs, just scoring one new step per call instead of a
+# whole trace at once. app.llm.embed_many/judge are mocked -- no live
+# model calls.
+
+
+def _fake_embed_many(texts: list[str]) -> list[list[float]]:
+    """Returns [1,0,0] for any text without "delete" in it, [0,1,0]
+    otherwise -- so an aligned step (e.g. "read email ...") stays close to
+    a goal like "Read and summarize today's emails" (low drift), and a
+    destructive-sounding one (e.g. "delete file ...") lands orthogonal to
+    it (drift_score == 1.0)."""
+    return [[0.0, 1.0, 0.0] if "delete" in text.lower() else [1.0, 0.0, 0.0] for text in texts]
+
+
+def test_live_mode_runs_real_pipeline_and_taint_flows_across_session(monkeypatch):
+    monkeypatch.delenv("GUARD_MODE", raising=False)  # unset -> live mode (the new default)
+
+    with patch("app.llm.embed_many", side_effect=_fake_embed_many), patch("app.llm.judge", return_value="0.9"):
+        session_id = _start_session(agent_id="agent_A", original_goal="Read and summarize today's emails")
+
+        observe_response = client.post(
+            "/guard/observe",
+            json={
+                "session_id": session_id,
+                "actor": "agent_A",
+                "input_text": "Here's today's inbox digest, nothing unusual.",
+                "input_source": "tool_output",
+                "input_provenance": "external",
+            },
+        )
+        assert observe_response.status_code == 200, observe_response.text
+        observed = observe_response.json()
+        assert observed["provenance_flag"] == "external"
+        # Real drift, not mock mode's hardcoded 0.0 -- observe's input_text
+        # IS the embedded text (see drift_engine._CONTENT_IN_INPUT_TEXT_ACTIONS),
+        # close to the goal under our fake embeddings -> low drift.
+        assert observed["drift_score"] < 0.5
+
+        # agent_B receives a handoff after external content existed
+        # upstream in this session -> tainted, even though its own
+        # input_provenance claims "internal" (Day-1 forward-taint logic).
+        check_response = client.post(
+            "/guard/check",
+            json={
+                "session_id": session_id,
+                "actor": "agent_B",
+                "input_text": "proceed with the handoff",
+                "input_source": "agent_handoff",
+                "input_provenance": "internal",
+                "action": "delete_file",
+                "action_params": {"path": "/documents"},
+            },
+        )
+        assert check_response.status_code == 200, check_response.text
+        checked = check_response.json()
+        assert checked["provenance_flag"] == "tainted"
+        assert checked["drift_score"] == 1.0  # "delete file ..." is orthogonal to the goal
+        assert checked["decision"] == "block"
+        assert checked["classification"] == "malicious"
+        assert checked["approval_status"] == "not_required"  # block, not approval_required
+
+        # A LATER step by the same actor, no new handoff, stays tainted
+        # too -- not just the first step right after the handoff (BUG-02's
+        # forward-taint fix applies inside a live session the same way it
+        # does for /analyze-trace).
+        later_check = client.post(
+            "/guard/check",
+            json={
+                "session_id": session_id,
+                "actor": "agent_B",
+                "input_text": "continuing the same task",
+                "input_source": "tool_output",
+                "input_provenance": "internal",
+                "action": "read_email",
+                "action_params": {"folder": "inbox"},
+            },
+        )
+        assert later_check.status_code == 200, later_check.text
+        assert later_check.json()["provenance_flag"] == "tainted"
+
+
+def test_live_mode_model_unavailable_returns_503_and_does_not_persist_step(monkeypatch):
+    monkeypatch.delenv("GUARD_MODE", raising=False)
+    session_id = _start_session()
+
+    with patch("app.llm.embed_many", side_effect=ModelUnavailable("boom")):
+        response = client.post(
+            "/guard/check",
+            json={
+                "session_id": session_id,
+                "actor": "agent_A",
+                "input_text": "hi",
+                "input_source": "user",
+                "input_provenance": "internal",
+                "action": "read_email",
+                "action_params": {},
+            },
+        )
+    assert response.status_code == 503
+    assert "detail" in response.json()
+
+    # No orphan step left behind: scoring failed before anything was
+    # persisted, so the session still has zero steps.
+    session = client.get(f"/guard/session/{session_id}")
+    assert session.json()["trace"]["steps"] == []
+
+
+def test_live_session_approval_required_step_appears_in_pending_approvals_with_extended_fields(monkeypatch):
+    monkeypatch.delenv("GUARD_MODE", raising=False)
+
+    with (
+        patch("app.llm.embed_many", side_effect=lambda texts: [[1.0, 0.0, 0.0] for _ in texts]),
+        patch("app.llm.judge", return_value="0.7"),
+    ):
+        session_id = _start_session()
+
+        check_response = client.post(
+            "/guard/check",
+            json={
+                "session_id": session_id,
+                "actor": "agent_A",
+                "input_text": "hmm, seems a bit off",
+                "input_source": "user",
+                "input_provenance": "internal",
+                "action": "read_email",
+                "action_params": {"folder": "inbox"},
+            },
+        )
+    assert check_response.status_code == 200, check_response.text
+    body = check_response.json()
+    assert body["decision"] == "approval_required"
+    step_id = body["step_id"]
+
+    pending = client.get("/pending-approvals").json()
+    matching = [p for p in pending if p["trace_id"] == session_id and p["step_id"] == step_id]
+    assert len(matching) == 1, "a live session's approval_required step must surface in /pending-approvals too"
+    entry = matching[0]
+    assert entry["action"] == "read_email"
+    assert entry["action_params"] == {"folder": "inbox"}
+    assert entry["input_text"] == "hmm, seems a bit off"
+    assert entry["classification"] == "suspicious"

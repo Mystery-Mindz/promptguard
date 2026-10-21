@@ -72,6 +72,14 @@ class PendingApproval(BaseModel):
     provenance_flag: ProvenanceFlag
     explanation: str
     timestamp: datetime
+    # Added for Prompt 3.1 — additive fields only, so the console can show
+    # what is actually being approved (the action and the text that
+    # triggered it), not just its score.
+    action: str
+    action_params: dict[str, Any]
+    input_text: str
+    drift_score: float
+    classification: Classification
 
 
 class TraceWithDetections(BaseModel):

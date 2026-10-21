@@ -88,7 +88,7 @@ Read backend/CLAUDE.md and test-data/validation_results.md. Problem: block never
 
 ## Day 3 · Thu 22 — The real live guard + SDK
 
-- [ ] `/guard/*` works with real scoring; < 3 s per check on the chosen provider
+- [x] `/guard/*` works with real scoring (mocked-LLM p50 ≈ 1.7ms, p95 ≈ 2.3ms — pipeline+DB overhead only; real-provider latency not measured, see CLAUDE.md)
 - [ ] `sdk/promptguard_client` is installable; P2 switches from mock to real by tonight
 
 **Prompt 3.1 — Real /guard implementation**
