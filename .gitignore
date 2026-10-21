@@ -5,3 +5,7 @@ __pycache__/
 .DS_Store
 .streamlit/secrets.toml
 *.db
+*.egg-info/
+.mypy_cache/
+.ruff_cache/
+.pytest_cache/

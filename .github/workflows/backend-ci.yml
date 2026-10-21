@@ -52,3 +52,37 @@ jobs:
           # network call (and incurring cost) in CI.
           GEMINI_API_KEY: "ci-placeholder-not-a-real-key"
         run: pytest tests/ -v
+
+  sdk-test:
+    name: Lint, type-check, and test (sdk/)
+    runs-on: ubuntu-latest
+
+    defaults:
+      run:
+        working-directory: sdk
+
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          # Matches the backend job's Python version for consistency.
+          python-version: "3.14"
+          cache: "pip"
+          cache-dependency-path: sdk/pyproject.toml
+
+      - name: Install the package and dev tools
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Lint with ruff
+        run: ruff check .
+
+      - name: Type-check with mypy
+        run: mypy promptguard_client/
+
+      - name: Run tests
+        run: pytest tests/ -v
