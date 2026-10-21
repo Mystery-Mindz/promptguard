@@ -4,12 +4,12 @@ POST /auth/login endpoint, and the `python -m app.create_operator` CLI.
 No live API/model calls anywhere in this file.
 """
 
-import sqlite3
 from datetime import UTC, datetime, timedelta
 
 import jwt
 import pytest
 from fastapi.testclient import TestClient
+from sqlalchemy.exc import IntegrityError
 
 from app import config, create_operator, main, storage
 from app.auth import create_token, hash_password, require_operator, verify_password
@@ -21,7 +21,7 @@ client = TestClient(app)
 
 @pytest.fixture(autouse=True)
 def temp_db(tmp_path, monkeypatch):
-    monkeypatch.setattr(config, "DATABASE_PATH", str(tmp_path / "test.db"))
+    monkeypatch.setattr(config, "DATABASE_URL", f"sqlite:///{tmp_path / 'test.db'}")
     storage.init_db()
 
 
@@ -58,7 +58,7 @@ def test_get_operator_by_username_returns_none_for_unknown_username():
 
 def test_create_operator_duplicate_username_raises_integrity_error():
     storage.create_operator("jane", hash_password("pw1"))
-    with pytest.raises(sqlite3.IntegrityError):
+    with pytest.raises(IntegrityError):
         storage.create_operator("jane", hash_password("pw2"))
 
 

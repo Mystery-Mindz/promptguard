@@ -28,7 +28,7 @@ known_bug = pytest.mark.xfail(strict=True, reason="Known bug from the 19 Oct aud
 
 @pytest.fixture(autouse=True)
 def temp_db(tmp_path, monkeypatch):
-    monkeypatch.setattr(config, "DATABASE_PATH", str(tmp_path / "test.db"))
+    monkeypatch.setattr(config, "DATABASE_URL", f"sqlite:///{tmp_path / 'test.db'}")
     storage.init_db()
 
 

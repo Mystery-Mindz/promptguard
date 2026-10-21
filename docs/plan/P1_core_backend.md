@@ -122,7 +122,7 @@ Read the /guard contract in docs/plan/00_OVERVIEW.md. Create sdk/promptguard_cli
 ## Day 4 · Fri 23 — Real auth + persistent storage
 
 - [x] Operators log in; the backend enforces the token; `/guard/*` needs an API key
-- [ ] Works on Postgres (Neon) and SQLite
+- [x] Works on Postgres (Neon) and SQLite (SQLAlchemy Core, chosen by `DATABASE_URL`; verified against a real local Postgres container, not just SQLite)
 - [x] Tell P3 the `/auth/login` contract is live (see the note at the top of `docs/plan/P3_interfaces_deploy.md`)
 
 **Prompt 4.1 — Auth, API keys, rate limits (fixes BUG-06)**

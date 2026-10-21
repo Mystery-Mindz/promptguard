@@ -99,12 +99,18 @@ INJECTION_CONFIDENCE_WEIGHT = 0.6
 # Agent loop cap — the only place this should be set.
 AGENT_MAX_STEPS = 6
 
-# SQLite persistence path — the only place this should be set. Overridable
-# via the DATABASE_PATH env var (e.g. to point at a mounted persistent
-# volume in a deployment container); defaults to a file next to the repo
-# for local dev.
-DATABASE_PATH = os.getenv(
-    "DATABASE_PATH", os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "promptguard.db")
+# Persistence (app/storage.py, Prompt 4.2) — the only place this should be
+# set. DATABASE_URL picks the backend: a `sqlite:///...` URL (SQLite,
+# local dev and tests) or a `postgresql://...` URL (Postgres -- Render's
+# free disk is wiped on every redeploy, so production needs a real
+# database that survives one; Neon works well here). Defaults to a
+# `sqlite:///` URL pointing at a file next to the repo, for local dev with
+# no setup. `storage._get_engine()` builds the actual SQLAlchemy engine
+# from this (and normalizes a bare `postgresql://` to use the `psycopg`
+# (3.x) driver) -- nothing here needs to know that detail.
+DATABASE_URL = os.getenv(
+    "DATABASE_URL",
+    "sqlite:///" + os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "promptguard.db"),
 )
 
 # Gemini client timeout — the only place this should be set.

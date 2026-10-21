@@ -1,10 +1,10 @@
 import os
 import secrets
-import sqlite3
 from datetime import UTC, datetime
 
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
+from sqlalchemy.exc import IntegrityError
 
 from app import config, guard, storage
 from app.agent import run_agent
@@ -269,7 +269,7 @@ def pending_approvals_endpoint(
 def _already_decided_error(trace_id: str, step_id: int, existing_decision: dict) -> HTTPException:
     """Builds the 409 raised when a `(trace_id, step_id)` already has a
     recorded operator decision — shared by the normal pre-check in
-    `approval_decision_endpoint` and by its `sqlite3.IntegrityError`
+    `approval_decision_endpoint` and by its `sqlalchemy.exc.IntegrityError`
     fallback for the near-simultaneous-request race (BUG-12), so both
     paths report the exact same thing to the caller.
 
@@ -350,13 +350,16 @@ def approval_decision_endpoint(
             final_status=final_status,
             timestamp=timestamp.isoformat(),
         )
-    except sqlite3.IntegrityError:
+    except IntegrityError:
         # A second, near-simultaneous request for this same (trace_id,
         # step_id) raced past the check above before this one committed its
         # INSERT. The unique (trace_id, step_id) primary key on
         # approval_decisions turns that race into a real constraint
         # violation instead of silently overwriting the winner (BUG-12) —
         # treat it exactly like the already-decided case above.
+        # sqlalchemy.exc.IntegrityError uniformly wraps whichever driver's
+        # own exception actually fired (sqlite3.IntegrityError, psycopg's
+        # UniqueViolation, etc.) -- same handling regardless of backend.
         winning_decision = storage.get_approval_decision(request.trace_id, request.step_id)
         assert winning_decision is not None, "IntegrityError implies a row now exists"
         raise _already_decided_error(request.trace_id, request.step_id, winning_decision) from None

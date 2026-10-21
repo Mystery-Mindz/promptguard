@@ -6,8 +6,9 @@ section and `docs/plan/P1_core_backend.md`'s Prompt 4.1.
 
 import argparse
 import getpass
-import sqlite3
 import sys
+
+from sqlalchemy.exc import IntegrityError
 
 from app import storage
 from app.auth import hash_password
@@ -30,7 +31,7 @@ def main() -> int:
     storage.init_db()
     try:
         operator_id = storage.create_operator(args.username, hash_password(password))
-    except sqlite3.IntegrityError:
+    except IntegrityError:
         print(f"Operator {args.username!r} already exists.", file=sys.stderr)
         return 1
 
