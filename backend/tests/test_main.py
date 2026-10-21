@@ -1,10 +1,13 @@
+import json
+import os
 from datetime import datetime, timezone
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import pytest
 from fastapi.testclient import TestClient
 
 from app import config, storage
+from app.llm import GenerateResult, ToolCall
 from app.main import app
 from app.schemas import DetectionOutput, Trace, TraceStep
 
@@ -319,23 +322,15 @@ def test_run_agent_handles_hallucinated_tool_call_without_crashing():
     KeyError -> 500. This confirms it now degrades gracefully instead:
     no crash, a real trace step recorded, a normal 200 response.
     """
-    hallucinated_call = MagicMock(name="list_files", args={}, id="call_1")
-    hallucinated_call.name = "list_files"
+    hallucinated_call = ToolCall(id="call_1", name="list_files", args={})
 
-    first_response = MagicMock()
-    first_response.function_calls = [hallucinated_call]
-    first_response.candidates = [MagicMock()]
-
-    second_response = MagicMock()
-    second_response.function_calls = None
-
-    mock_client = MagicMock()
-    mock_client.models.generate_content.side_effect = [first_response, second_response]
-
-    with (
-        patch("app.agent._get_client", return_value=mock_client),
-        patch("app.agent._pace_calls"),
-    ):
+    with patch(
+        "app.llm.generate_with_tools",
+        side_effect=[
+            GenerateResult(text=None, tool_calls=[hallucinated_call]),
+            GenerateResult(text="done", tool_calls=[]),
+        ],
+    ) as mock_generate:
         response = client.post(
             "/run-agent",
             json={
@@ -357,6 +352,45 @@ def test_run_agent_handles_hallucinated_tool_call_without_crashing():
 
     # The model must have been told the call failed, so it could try to
     # recover, instead of the request just crashing.
-    second_call_contents = mock_client.models.generate_content.call_args_list[1].kwargs["contents"]
-    function_response_part = second_call_contents[-1].parts[0]
-    assert function_response_part.function_response.response == {"error": "tool 'list_files' is not available"}
+    second_call_messages = mock_generate.call_args_list[1].args[0]
+    tool_result_message = second_call_messages[-1]
+    assert tool_result_message.tool_results[0].output == {"error": "tool 'list_files' is not available"}
+
+
+def test_analyze_trace_batches_embeddings_across_the_whole_trace():
+    """Regression test for Prompt 2.1's batching requirement: analysing
+    the real 3-step cross-agent-handoff demo trace must make exactly ONE
+    llm.embed_many call covering the goal + all 3 steps' texts (4 texts),
+    not one call per step -- down from 6 separate embed calls (2 per step:
+    goal + action, re-embedding the goal every time) before this change.
+    judge() stays per-step (3 calls): it isn't a vectorizable batch
+    operation the way embeddings are.
+    """
+    demo_trace_path = os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        "..",
+        "test-data",
+        "demo_cross_agent_handoff.json",
+    )
+    with open(demo_trace_path) as f:
+        trace = json.load(f)
+    trace.pop("expected_flagged_steps", None)
+    assert len(trace["steps"]) == 3
+
+    with (
+        patch("app.llm.embed_many", side_effect=lambda texts: [[1.0, 0.0, 0.0] for _ in texts]) as mock_embed_many,
+        patch("app.llm.judge", return_value="0.5") as mock_judge,
+    ):
+        response = client.post("/analyze-trace", json=trace)
+
+    assert response.status_code == 200
+
+    assert mock_embed_many.call_count == 1, "all embeddings for one trace must go in ONE batched call"
+    texts_sent = mock_embed_many.call_args.args[0]
+    assert len(texts_sent) == 4, "goal + 3 steps = 4 texts in that one call"
+
+    assert mock_judge.call_count == 3, "judge is per-step, not batched -- one call per step"
+
+    # Total model calls for this trace: 1 (embed_many) + 3 (judge) = 4,
+    # down from 9 (6 embed calls + 3 judge calls) before batching.
+    assert mock_embed_many.call_count + mock_judge.call_count == 4

@@ -10,6 +10,7 @@ from app import guard, storage
 from app.agent import run_agent
 from app.drift_engine import compute_drift_and_risk
 from app.gate import classification_for, decide
+from app.llm import ModelUnavailable
 from app.provenance import get_provenance_flag
 from app.schemas import (
     ApprovalDecisionRequest,
@@ -83,10 +84,19 @@ def run_agent_endpoint(request: RunAgentRequest) -> Trace:
       concurrent/repeated runs never collide on the same trace_id.
     - `agent_id`: which agent is acting (has a default).
 
-    Returns the resulting `Trace`.
+    Returns the resulting `Trace`. Responds with 503 and a readable
+    `detail` if the agent model is unavailable (a 429/503 from the
+    provider that survived retries, and fallback if configured — see
+    `app/llm.py`).
     """
     trace_id = request.trace_id or _generate_trace_id()
-    return run_agent(request.original_goal, trace_id, request.agent_id)
+    try:
+        return run_agent(request.original_goal, trace_id, request.agent_id)
+    except ModelUnavailable as e:
+        raise HTTPException(
+            status_code=503,
+            detail=f"Agent model is currently unavailable, could not run trace_id={trace_id!r}: {e}",
+        ) from e
 
 
 def _explanation_for(step: TraceStep, drift_score: float, risk_score: int, provenance_flag: ProvenanceFlag) -> str:
@@ -128,11 +138,13 @@ def analyze_trace(trace: Trace) -> list[DetectionOutput]:
     `GET /trace/{trace_id}`) and each detection result (so
     `GET /pending-approvals` and `POST /approval-decision` can see it).
 
-    If the drift engine's underlying Gemini call fails partway through
-    (e.g. a 429/503 from the model provider), responds with 503 and a
-    readable `detail` message instead of a bare 500 — and deletes the
-    trace entirely rather than leaving some steps scored and others
-    missing; retry `/analyze-trace` from scratch once the error clears.
+    If the drift engine's underlying model call fails partway through
+    (e.g. a 429/503 from the provider that survived retries, and fallback
+    if configured — see `app/llm.py`'s `ModelUnavailable`), responds with
+    503 and a readable `detail` message instead of a bare 500 — and
+    deletes the trace entirely rather than leaving some steps scored and
+    others missing; retry `/analyze-trace` from scratch once the error
+    clears.
     """
     storage.save_trace(trace)
     outputs: list[DetectionOutput] = []
@@ -140,6 +152,13 @@ def analyze_trace(trace: Trace) -> list[DetectionOutput]:
     for step in trace.steps:
         try:
             drift_score, risk_score = compute_drift_and_risk(trace, step.step_id)
+        except ModelUnavailable as e:
+            storage.delete_trace(trace.trace_id)
+            raise HTTPException(
+                status_code=503,
+                detail=f"Detection model is currently unavailable, analyzing trace_id={trace.trace_id!r} "
+                f"step {step.step_id} failed after retries: {e}",
+            ) from e
         except Exception as e:
             storage.delete_trace(trace.trace_id)
             raise HTTPException(

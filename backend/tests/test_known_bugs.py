@@ -9,14 +9,14 @@ commit. Never delete or weaken a test to make it pass.
 
 import re
 from datetime import UTC, datetime
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import pytest
 from fastapi.testclient import TestClient
-from google.genai import types
 
 from app import config, storage
 from app.drift_engine import _classify_injection
+from app.llm import GenerateResult, ToolCall
 from app.main import app
 from app.provenance import get_provenance_flag
 from app.schemas import DetectionOutput, Trace, TraceStep
@@ -164,19 +164,17 @@ def test_bug02_handoff_with_no_external_content_upstream_is_not_a_false_positive
 
 
 def test_bug03_run_agent_survives_tool_call_with_missing_arguments():
-    bad_call = MagicMock(args={}, id="call_1")  # send_message requires `to` and `content`
-    bad_call.name = "send_message"
+    # send_message requires `to` and `content`; the model calls it with
+    # neither, which raises a TypeError agent.py must catch, not crash on.
+    bad_call = ToolCall(id="call_1", name="send_message", args={})
 
-    first = MagicMock()
-    first.function_calls = [bad_call]
-    first.candidates = [MagicMock()]
-    second = MagicMock()
-    second.function_calls = None
-
-    mock_client = MagicMock()
-    mock_client.models.generate_content.side_effect = [first, second]
-
-    with patch("app.agent._get_client", return_value=mock_client), patch("app.agent._pace_calls"):
+    with patch(
+        "app.llm.generate_with_tools",
+        side_effect=[
+            GenerateResult(text=None, tool_calls=[bad_call]),
+            GenerateResult(text="done", tool_calls=[]),
+        ],
+    ):
         response = client.post("/run-agent", json={"original_goal": "message the team", "trace_id": "bad_args"})
 
     assert response.status_code == 200, response.text
@@ -229,20 +227,15 @@ def test_bug07_injection_prompt_wraps_untrusted_text_in_random_boundary_and_resi
 
     captured: dict[str, str] = {}
 
-    def fake_generate_content(**kwargs):
-        captured["contents"] = kwargs["contents"]
-        response = MagicMock()
-        response.text = "0.9"
-        return response
+    def fake_judge(prompt, **kwargs):
+        captured["prompt"] = prompt
+        return "0.9"
 
-    mock_client = MagicMock()
-    mock_client.models.generate_content.side_effect = fake_generate_content
-
-    with patch("app.drift_engine._get_client", return_value=mock_client), patch("app.drift_engine._pace_calls"):
+    with patch("app.llm.judge", side_effect=fake_judge):
         confidence = _classify_injection(malicious_text)
 
     assert confidence == 0.9
-    prompt = captured["contents"]
+    prompt = captured["prompt"]
 
     open_tags = re.findall(r"<untrusted_[0-9a-f]{6}>", prompt)
     close_tags = re.findall(r"</untrusted_[0-9a-f]{6}>", prompt)
@@ -264,40 +257,31 @@ def test_bug07_injection_prompt_wraps_untrusted_text_in_random_boundary_and_resi
 
 
 def test_bug08_parallel_function_calls_get_one_combined_function_response_turn():
-    """When Gemini returns several function calls in one turn, all of their
-    function_responses must go back in ONE user Content, not one Content
-    per call — Gemini can reject/misbehave on the next request otherwise."""
-    call_1 = MagicMock(args={"folder": "inbox"}, id="call_1")
-    call_1.name = "read_email"
-    call_2 = MagicMock(args={"to": "me", "content": "hi"}, id="call_2")
-    call_2.name = "send_message"
+    """When the model returns several tool calls in one turn, all of their
+    results must go back in ONE user Message (tool_results holding both),
+    not one Message per call — Gemini (via app/llm.py's translation) can
+    reject/misbehave on the next request otherwise."""
+    call_1 = ToolCall(id="call_1", name="read_email", args={"folder": "inbox"})
+    call_2 = ToolCall(id="call_2", name="send_message", args={"to": "me", "content": "hi"})
 
-    first = MagicMock()
-    first.function_calls = [call_1, call_2]
-    first.candidates = [MagicMock()]
-    second = MagicMock()
-    second.function_calls = None
-
-    mock_client = MagicMock()
-    mock_client.models.generate_content.side_effect = [first, second]
-
-    with patch("app.agent._get_client", return_value=mock_client), patch("app.agent._pace_calls"):
+    with patch(
+        "app.llm.generate_with_tools",
+        side_effect=[
+            GenerateResult(text=None, tool_calls=[call_1, call_2]),
+            GenerateResult(text="done", tool_calls=[]),
+        ],
+    ) as mock_generate:
         response = client.post("/run-agent", json={"original_goal": "do two things", "trace_id": "parallel_calls"})
 
     assert response.status_code == 200, response.text
 
-    second_call_kwargs = mock_client.models.generate_content.call_args_list[1].kwargs
-    contents_sent = second_call_kwargs["contents"]
+    second_call_messages = mock_generate.call_args_list[1].args[0]
+    tool_result_messages = [m for m in second_call_messages if m.role == "user" and m.tool_results]
+    assert len(tool_result_messages) == 1, "both tool results must be sent back in ONE user Message"
 
-    real_user_contents = [c for c in contents_sent if isinstance(c, types.Content) and c.role == "user"]
-    function_response_turns = [
-        c for c in real_user_contents if any(p.function_response is not None for p in (c.parts or []))
-    ]
-    assert len(function_response_turns) == 1, "both function responses must be sent back in ONE user Content"
-
-    combined = function_response_turns[0]
-    assert len(combined.parts) == 2
-    returned_names = {part.function_response.name for part in combined.parts}
+    combined = tool_result_messages[0]
+    assert len(combined.tool_results) == 2
+    returned_names = {result.name for result in combined.tool_results}
     assert returned_names == {"read_email", "send_message"}
 
 

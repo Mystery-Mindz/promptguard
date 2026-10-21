@@ -1,8 +1,9 @@
 """End-to-end check of a RUNNING PromptGuard backend (local or deployed).
 
-Uses real Gemini calls: about 3 judge calls + 6 embedding calls for the demo
-trace, plus 1–6 agent calls if you pass --with-agent. Mind the free-tier
-daily quota.
+Uses real Gemini calls: about 3 judge calls + 1 batched embedding call for
+the demo trace (down from 6 separate embedding calls before app/llm.py's
+per-trace batching, Prompt 2.1), plus 1-6 agent calls if you pass
+--with-agent. Mind the free-tier daily quota.
 
 Usage (from backend/, with the server already running):
     python scripts/live_check.py

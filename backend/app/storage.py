@@ -2,6 +2,7 @@ import json
 import sqlite3
 from contextlib import contextmanager
 from datetime import UTC, datetime
+from typing import Any
 
 from app import config
 from app.schemas import DetectionOutput, Trace, TraceStep, TraceWithDetections
@@ -110,6 +111,17 @@ def init_db() -> None:
                 action_params TEXT NOT NULL,
                 timestamp TEXT NOT NULL,
                 PRIMARY KEY (trace_id, step_id)
+            )
+            """
+        )
+
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS llm_cache (
+                cache_key TEXT PRIMARY KEY,
+                model TEXT NOT NULL,
+                value TEXT NOT NULL,
+                created_at TEXT NOT NULL
             )
             """
         )
@@ -527,4 +539,44 @@ def save_approval_decision(
             VALUES (?, ?, ?, ?, ?, ?)
             """,
             (trace_id, step_id, operator_decision, operator_id, final_status, timestamp),
+        )
+
+
+def get_cached_llm_value(cache_key: str) -> Any | None:
+    """Looks up a previously-cached model result (a judge's raw text reply
+    or an embedding vector) by `cache_key` (a `sha256(model + text)` hex
+    digest — see `app.llm`). This is the DB-backed half of `app.llm`'s
+    cache; the in-memory LRU in front of it is checked first by the
+    caller and is not persisted here.
+
+    Parameters:
+    - `cache_key`: the cache key to look up.
+
+    Returns the cached value (JSON-decoded back into its original shape —
+    a `str` for a judge reply, a `list[float]` for an embedding), or
+    `None` if nothing is cached under this key yet.
+    """
+    with _connect() as conn:
+        row = conn.execute("SELECT value FROM llm_cache WHERE cache_key = ?", (cache_key,)).fetchone()
+    return json.loads(row[0]) if row else None
+
+
+def set_cached_llm_value(cache_key: str, model: str, value: Any) -> None:
+    """Stores (or overwrites) one model result in the `llm_cache` table,
+    keyed by `cache_key` (see `get_cached_llm_value`).
+
+    Parameters:
+    - `cache_key`: the cache key to store under.
+    - `model`: the model that actually produced `value` — recorded
+      alongside the key for debugging/inspection, not used for lookup
+      (the key itself already encodes the model, see `app.llm._cache_key`).
+    - `value`: the result to cache (JSON-encoded — must be JSON-serializable,
+      e.g. a `str` or a `list[float]`).
+
+    Returns nothing.
+    """
+    with _connect() as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO llm_cache (cache_key, model, value, created_at) VALUES (?, ?, ?, ?)",
+            (cache_key, model, json.dumps(value), datetime.now(UTC).isoformat()),
         )

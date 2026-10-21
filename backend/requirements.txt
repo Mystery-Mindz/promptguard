@@ -6,6 +6,11 @@
 # silently resolve to a different release on a future install and change
 # behavior. Dev-only tools (ruff, mypy) are pinned separately in
 # requirements-dev.txt, not mixed in here.
+#
+# tenacity was already present as a transitive dep of google-genai; as of
+# the Prompt 2.1 provider layer (app/llm.py), it's now also a direct
+# dependency (retry/backoff on 429/503) — no version bump needed, just
+# noting it's no longer "only" transitive.
 annotated-doc==0.0.5
 annotated-types==0.8.0
 anyio==4.15.1

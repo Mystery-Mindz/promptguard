@@ -1,27 +1,12 @@
-import time
 from collections.abc import Callable
 from datetime import UTC, datetime
 from typing import Any
 
-from google import genai
-from google.genai import types
-
-from app.config import (
-    AGENT_MAX_STEPS,
-    AGENT_MODEL,
-    GEMINI_API_KEY,
-    GEMINI_CLIENT_TIMEOUT_MS,
-    MIN_SECONDS_BETWEEN_GEMINI_CALLS,
-)
+from app import llm
+from app.config import AGENT_MAX_STEPS
+from app.llm import GenerateResult, Message, ToolDeclaration, ToolResult
 from app.schemas import InputProvenance, InputSource, Trace, TraceStep
 from app.tools import delete_file, read_email, send_message
-
-# Gemini's free tier caps generate_content at 5 requests/minute per model.
-# Without pacing, a chain of calls fails into 429s that each trigger the
-# SDK's own internal retry-with-backoff *and* still leave the caller to
-# retry again — compounding into multi-minute stalls. Enforcing a floor on
-# the gap between calls keeps normal runs under quota in the first place.
-_last_call_at: float = 0.0
 
 SYSTEM_PROMPT = (
     "You are an AI agent that accomplishes the user's goal by calling the tools "
@@ -30,71 +15,47 @@ SYSTEM_PROMPT = (
 )
 
 TOOL_DECLARATIONS = [
-    types.FunctionDeclaration(
+    ToolDeclaration(
         name="read_email",
         description="Read emails from a folder in the user's inbox.",
-        parameters=types.Schema(
-            type=types.Type.OBJECT,
-            properties={
-                "folder": types.Schema(type=types.Type.STRING, description="The folder to read, e.g. 'inbox'."),
+        parameters={
+            "type": "object",
+            "properties": {
+                "folder": {"type": "string", "description": "The folder to read, e.g. 'inbox'."},
             },
-            required=["folder"],
-        ),
+            "required": ["folder"],
+        },
     ),
-    types.FunctionDeclaration(
+    ToolDeclaration(
         name="delete_file",
         description="Delete a file at the given path.",
-        parameters=types.Schema(
-            type=types.Type.OBJECT,
-            properties={
-                "path": types.Schema(type=types.Type.STRING, description="The path of the file to delete."),
+        parameters={
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "The path of the file to delete."},
             },
-            required=["path"],
-        ),
+            "required": ["path"],
+        },
     ),
-    types.FunctionDeclaration(
+    ToolDeclaration(
         name="send_message",
         description="Send a message to a recipient.",
-        parameters=types.Schema(
-            type=types.Type.OBJECT,
-            properties={
-                "to": types.Schema(type=types.Type.STRING, description="The recipient."),
-                "content": types.Schema(type=types.Type.STRING, description="The message content."),
+        parameters={
+            "type": "object",
+            "properties": {
+                "to": {"type": "string", "description": "The recipient."},
+                "content": {"type": "string", "description": "The message content."},
             },
-            required=["to", "content"],
-        ),
+            "required": ["to", "content"],
+        },
     ),
 ]
-
-GENERATE_CONFIG = types.GenerateContentConfig(
-    system_instruction=SYSTEM_PROMPT,
-    tools=[types.Tool(function_declarations=TOOL_DECLARATIONS)],
-)
 
 TOOL_FUNCTIONS: dict[str, Callable[..., Any]] = {
     "read_email": read_email,
     "delete_file": delete_file,
     "send_message": send_message,
 }
-
-_client: genai.Client | None = None
-
-
-def _get_client() -> genai.Client:
-    """Returns a shared Gemini API client, creating it the first time this is
-    called and reusing it on every later call (so the app doesn't open a new
-    connection for every request).
-
-    Takes no parameters. Returns a `genai.Client` configured with the API
-    key from `.env` and a connection timeout (`GEMINI_CLIENT_TIMEOUT_MS`)
-    so a stalled network call can't hang forever.
-    """
-    global _client
-    if _client is None:
-        # Explicit timeout so a stalled connection can't hang a call
-        # indefinitely — bounds worst-case latency per request.
-        _client = genai.Client(api_key=GEMINI_API_KEY, http_options=types.HttpOptions(timeout=GEMINI_CLIENT_TIMEOUT_MS))
-    return _client
 
 
 def _now() -> datetime:
@@ -106,28 +67,12 @@ def _now() -> datetime:
     return datetime.now(UTC)
 
 
-def _pace_calls() -> None:
-    """Pauses execution (if needed) so that consecutive calls to Gemini's
-    `generate_content` are always at least `MIN_SECONDS_BETWEEN_GEMINI_CALLS`
-    seconds apart. This keeps the agent loop under Gemini's free-tier rate
-    limit instead of hitting 429 "too many requests" errors.
-
-    Takes no parameters and returns nothing — it just sleeps for the
-    remaining wait time, if any, before the caller proceeds with its next
-    Gemini call.
-    """
-    global _last_call_at
-    elapsed = time.monotonic() - _last_call_at
-    if elapsed < MIN_SECONDS_BETWEEN_GEMINI_CALLS:
-        time.sleep(MIN_SECONDS_BETWEEN_GEMINI_CALLS - elapsed)
-    _last_call_at = time.monotonic()
-
-
 def run_agent(original_goal: str, trace_id: str, agent_id: str = "agent_A") -> Trace:
     """Runs a simulated AI agent that tries to accomplish `original_goal` by
     calling the mock tools in `tools.py` (read_email, delete_file,
-    send_message), one step at a time, using Gemini's function-calling to
-    decide which tool to call and with what arguments.
+    send_message), one step at a time, using `llm.generate_with_tools` to
+    decide which tool to call and with what arguments. Never talks to a
+    model API directly — all of that lives in `app/llm.py`.
 
     Parameters:
     - `original_goal`: the plain-English task given to the agent (e.g.
@@ -148,12 +93,12 @@ def run_agent(original_goal: str, trace_id: str, agent_id: str = "agent_A") -> T
     the untrusted content was read several steps earlier. The loop stops
     after `AGENT_MAX_STEPS` steps or as soon as the model stops requesting
     tool calls, whichever comes first.
-    """
-    client = _get_client()
 
-    contents: list[types.Content] = [
-        types.Content(role="user", parts=[types.Part(text=original_goal)]),
-    ]
+    Raises `llm.ModelUnavailable` if the configured provider (and
+    fallback, if any) can't complete a call even after retries —
+    `main.py` maps that to a clean HTTP 503.
+    """
+    messages: list[Message] = [Message(role="user", text=original_goal)]
 
     steps: list[TraceStep] = []
 
@@ -166,54 +111,33 @@ def run_agent(original_goal: str, trace_id: str, agent_id: str = "agent_A") -> T
     pending_input_provenance: InputProvenance = "internal"
 
     while len(steps) < AGENT_MAX_STEPS:
-        _pace_calls()
-        response = client.models.generate_content(
-            model=AGENT_MODEL,
-            contents=contents,
-            config=GENERATE_CONFIG,
-        )
+        result: GenerateResult = llm.generate_with_tools(messages, TOOL_DECLARATIONS, system_instruction=SYSTEM_PROMPT)
 
-        function_calls = response.function_calls
-        if not function_calls:
+        if not result.tool_calls:
             break
 
-        # Preserve the model's turn (text + function call parts) in the conversation.
-        assert response.candidates, "generate_content returned function_calls but no candidates"
-        model_turn = response.candidates[0].content
-        assert model_turn, "the model's candidate had no content"
-        contents.append(model_turn)
+        messages.append(Message(role="model", text=result.text, tool_calls=tuple(result.tool_calls)))
 
-        # Gemini expects every function_response for one model turn to come
-        # back together in a single user Content, not one Content per call —
-        # sending them as separate turns (as this used to do) can make the
-        # next request to the model reject or misbehave when the model
-        # returned several function calls at once. Collect them here and
-        # append ONE combined Content after the loop (BUG-08).
-        response_parts: list[types.Part] = []
+        tool_results: list[ToolResult] = []
 
-        for call in function_calls:
+        for call in result.tool_calls:
             if len(steps) >= AGENT_MAX_STEPS:
                 break
 
-            assert call.name, "a function call from Gemini had no tool name"
-            name = call.name
-            args: dict[str, Any] = dict(call.args or {})
-
-            tool_fn = TOOL_FUNCTIONS.get(name)
+            tool_fn = TOOL_FUNCTIONS.get(call.name)
             if tool_fn is None:
-                # Gemini asked to call a tool that was never declared in
+                # The model asked to call a tool that was never declared in
                 # TOOL_DECLARATIONS — a hallucinated tool call, not a real
                 # bug in the trace content itself. Record it as its own step
                 # (so it's visible in the trace instead of silently dropped)
-                # and tell the model it's invalid via a normal
-                # function_response, so it can recover on its own instead of
-                # this crashing the whole /run-agent request with an
-                # unhandled KeyError.
+                # and tell the model it's invalid via a normal tool result,
+                # so it can recover on its own instead of this crashing the
+                # whole /run-agent request with an unhandled KeyError.
                 steps.append(
                     TraceStep(
                         step_id=len(steps) + 1,
                         actor=agent_id,
-                        input_text=f"Model requested an undeclared tool call: '{name}' with args {args}",
+                        input_text=f"Model requested an undeclared tool call: '{call.name}' with args {call.args}",
                         # Not "user" or "tool_output" — this wasn't driven by
                         # the user's goal or by real tool content, it's the
                         # agent's own invalid decision. "agent_handoff" is
@@ -223,51 +147,43 @@ def run_agent(original_goal: str, trace_id: str, agent_id: str = "agent_A") -> T
                         # that, don't just add one here).
                         input_source="agent_handoff",
                         input_provenance="internal",
-                        action=name,
-                        action_params={"hallucinated_tool_call": True, "requested_args": args},
+                        action=call.name,
+                        action_params={"hallucinated_tool_call": True, "requested_args": call.args},
                         timestamp=_now(),
                     )
                 )
-                response_parts.append(
-                    types.Part(
-                        function_response=types.FunctionResponse(
-                            id=call.id,
-                            name=name,
-                            response={"error": f"tool '{name}' is not available"},
-                        )
-                    )
+                tool_results.append(
+                    ToolResult(call_id=call.id, name=call.name, output={"error": f"tool '{call.name}' is not available"})
                 )
                 continue
 
             try:
-                result = tool_fn(**args)
+                result_value = tool_fn(**call.args)
             except TypeError as e:
-                # Gemini called a real, declared tool but with bad arguments
-                # (missing a required one, an unexpected extra one, etc.) --
-                # not a bug in the trace content itself. Same pattern as the
-                # hallucinated-tool-call case above: record it as its own
-                # step and tell the model via a normal function_response so
-                # it can recover on its own, instead of an unhandled
-                # TypeError crashing the whole /run-agent request.
+                # The model called a real, declared tool but with bad
+                # arguments (missing a required one, an unexpected extra
+                # one, etc.) -- not a bug in the trace content itself. Same
+                # pattern as the hallucinated-tool-call case above: record
+                # it as its own step and tell the model via a normal tool
+                # result so it can recover on its own, instead of an
+                # unhandled TypeError crashing the whole /run-agent request.
                 steps.append(
                     TraceStep(
                         step_id=len(steps) + 1,
                         actor=agent_id,
-                        input_text=f"Model called '{name}' with invalid arguments {args}: {e}",
+                        input_text=f"Model called '{call.name}' with invalid arguments {call.args}: {e}",
                         input_source="agent_handoff",
                         input_provenance="internal",
-                        action=name,
-                        action_params={"invalid_tool_call": True, "requested_args": args, "error": str(e)},
+                        action=call.name,
+                        action_params={"invalid_tool_call": True, "requested_args": call.args, "error": str(e)},
                         timestamp=_now(),
                     )
                 )
-                response_parts.append(
-                    types.Part(
-                        function_response=types.FunctionResponse(
-                            id=call.id,
-                            name=name,
-                            response={"error": f"invalid arguments for tool '{name}': {e}"},
-                        )
+                tool_results.append(
+                    ToolResult(
+                        call_id=call.id,
+                        name=call.name,
+                        output={"error": f"invalid arguments for tool '{call.name}': {e}"},
                     )
                 )
                 continue
@@ -279,29 +195,19 @@ def run_agent(original_goal: str, trace_id: str, agent_id: str = "agent_A") -> T
                     input_text=pending_input_text,
                     input_source=pending_input_source,
                     input_provenance=pending_input_provenance,
-                    action=name,
-                    action_params=args,
+                    action=call.name,
+                    action_params=call.args,
                     timestamp=_now(),
                 )
             )
-
-            response_parts.append(
-                types.Part(
-                    function_response=types.FunctionResponse(
-                        id=call.id,
-                        name=name,
-                        response={"result": result},
-                    )
-                )
-            )
+            tool_results.append(ToolResult(call_id=call.id, name=call.name, output={"result": result_value}))
 
             # Email content is untrusted/external. Any step taken on the back
             # of it — including ones several turns later — must inherit that
             # provenance until fresh trusted input replaces it.
-            if name == "read_email":
+            if call.name == "read_email":
                 pending_input_text = "\n\n".join(
-                    f"From: {email['from']}\nSubject: {email['subject']}\n{email['body']}"
-                    for email in result
+                    f"From: {email['from']}\nSubject: {email['subject']}\n{email['body']}" for email in result_value
                 )
                 pending_input_source = "tool_output"
                 pending_input_provenance = "external"
@@ -320,12 +226,12 @@ def run_agent(original_goal: str, trace_id: str, agent_id: str = "agent_A") -> T
                             input_source=pending_input_source,
                             input_provenance=pending_input_provenance,
                             action="tool_output_received",
-                            action_params={"tool": name},
+                            action_params={"tool": call.name},
                             timestamp=_now(),
                         )
                     )
 
-        if response_parts:
-            contents.append(types.Content(role="user", parts=response_parts))
+        if tool_results:
+            messages.append(Message(role="user", tool_results=tuple(tool_results)))
 
     return Trace(trace_id=trace_id, agent_id=agent_id, original_goal=original_goal, steps=steps)
