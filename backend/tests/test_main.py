@@ -1,6 +1,6 @@
 import json
 import os
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from unittest.mock import patch
 
 import pytest
@@ -21,6 +21,26 @@ def temp_db(tmp_path, monkeypatch):
 
 
 def _seed(trace_id: str, step_id: int, decision: str) -> None:
+    # get_pending_approvals (Prompt 3.1) joins detection_outputs against
+    # trace_steps for the extended action/action_params/input_text fields
+    # -- a real detection always has a matching step (save_trace/
+    # append_step always runs before save_detection_output), so seed one
+    # here too instead of only the detection_outputs row.
+    storage.append_step(
+        trace_id,
+        "agent_A",
+        "test goal",
+        TraceStep(
+            step_id=step_id,
+            actor="agent_A",
+            input_text="test input text",
+            input_source="tool_output",
+            input_provenance="external",
+            action="read_email",
+            action_params={"folder": "inbox"},
+            timestamp=datetime.now(UTC),
+        ),
+    )
     storage.save_detection_output(
         DetectionOutput(
             trace_id=trace_id,
@@ -136,6 +156,12 @@ def test_pending_approvals_returns_correct_records_and_excludes_decided_ones():
     assert pending_entry["provenance_flag"] == "external"
     assert pending_entry["explanation"] == "test fixture"
     assert "timestamp" in pending_entry
+    # Prompt 3.1: additive fields, joined in from trace_steps.
+    assert pending_entry["action"] == "read_email"
+    assert pending_entry["action_params"] == {"folder": "inbox"}
+    assert pending_entry["input_text"] == "test input text"
+    assert pending_entry["drift_score"] == 0.5
+    assert pending_entry["classification"] == "suspicious"
 
 
 # --- Endpoint-level tests for /analyze-trace and /run-agent ---
@@ -293,7 +319,7 @@ def test_run_agent_endpoint_runs_end_to_end_without_error():
                 input_provenance="internal",
                 action="read_email",
                 action_params={"folder": "inbox"},
-                timestamp=datetime.now(timezone.utc),
+                timestamp=datetime.now(UTC),
             )
         ],
     )

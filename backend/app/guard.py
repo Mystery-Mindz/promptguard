@@ -1,21 +1,29 @@
 """The /guard/* live guard API (see docs/plan/00_OVERVIEW.md, section A).
 
-This is a working skeleton for Day 1 of the 7-day plan: `GUARD_MODE=mock`
-gives deterministic, LLM-free scoring so P2 (the Protected Assistant) can
-integrate against a real contract today, with sessions/approvals stored
-for real so the full approval loop works end to end. The real
-drift+judge+provenance pipeline lands on Day 3 (Prompt 3.1); until then,
-any `GUARD_MODE` other than `"mock"` (including unset) returns 501.
+`GUARD_MODE=mock` gives deterministic, LLM-free scoring (Prompt 1.3) so P2
+(the Protected Assistant) can integrate against the contract without
+waiting on real model calls. `GUARD_MODE` unset or `"mock"` gives the real
+drift+judge+provenance+gate pipeline (Prompt 3.1) — the same pipeline
+`/analyze-trace` uses, just run incrementally: a session is a live trace
+(`trace_id` == `session_id`) that grows one step at a time via
+`storage.append_step`, and each `/guard/observe`/`/guard/check` call scores
+ONLY the new step, against the session's accumulated history so far.
+Any other `GUARD_MODE` value is a misconfiguration (`HTTPException(500)`).
 """
 
+import logging
 import os
 import secrets
+import time
 from datetime import UTC, datetime
+from typing import Literal
 
 from fastapi import APIRouter, HTTPException
 
 from app import config, storage
-from app.gate import classification_for, decide
+from app.drift_engine import compute_drift_and_risk
+from app.gate import classification_for, decide, explanation_for_step
+from app.llm import ModelUnavailable
 from app.provenance import get_provenance_flag
 from app.schemas import (
     Decision,
@@ -35,6 +43,9 @@ from app.schemas import (
 )
 
 router = APIRouter(prefix="/guard", tags=["guard"])
+logger = logging.getLogger(__name__)
+
+GuardMode = Literal["mock", "live"]
 
 # Deterministic mock-mode scoring rules (no LLM calls) — see Prompt 1.3 in
 # docs/plan/P1_core_backend.md for the exact spec. The destructive-action
@@ -43,21 +54,27 @@ router = APIRouter(prefix="/guard", tags=["guard"])
 MOCK_SUSPICIOUS_PHRASES = ("ignore previous", "urgent", "administrator", "forward", "delete all")
 
 
-def _require_mock_mode() -> None:
-    """Gates every `/guard/*` route on `GUARD_MODE=mock` for now. Read
-    fresh from the environment on every call (not cached at import time
-    like the rest of `config.py`) so it behaves like a live feature flag
-    and so tests can toggle it per-test with `monkeypatch.setenv`.
+def _resolve_mode() -> GuardMode:
+    """Reads `GUARD_MODE` fresh from the environment on every call (not
+    cached at import time like the rest of `config.py`) so it behaves like
+    a live feature flag and so tests can toggle it per-test with
+    `monkeypatch.setenv`.
 
-    Takes no parameters. Returns nothing if `GUARD_MODE == "mock"`.
-    Raises `HTTPException(501)` otherwise — the real implementation
-    (`GUARD_MODE` unset or `"live"`) lands on Day 3 (Prompt 3.1).
+    Takes no parameters. Returns `"mock"` if `GUARD_MODE == "mock"`;
+    `"live"` if it's unset or `"live"` (the real drift+judge+provenance+
+    gate pipeline, Prompt 3.1 — this is now the default, replacing the old
+    Day-1 skeleton's 501). Raises `HTTPException(500)` for any other value,
+    since that's a misconfiguration, not a valid mode.
     """
-    if os.getenv("GUARD_MODE") != "mock":
-        raise HTTPException(
-            status_code=501,
-            detail="GUARD_MODE=mock is not set. The real /guard/* implementation is not available yet (Day 3).",
-        )
+    raw = os.getenv("GUARD_MODE")
+    if raw is None or raw == "live":
+        return "live"
+    if raw == "mock":
+        return "mock"
+    raise HTTPException(
+        status_code=500,
+        detail=f"Invalid GUARD_MODE={raw!r}; expected 'mock' or 'live' (unset also means 'live').",
+    )
 
 
 def _get_session_trace(session_id: str) -> Trace:
@@ -81,8 +98,8 @@ def _mock_score(trace_so_far: Trace, step: TraceStep) -> int:
     external observation in this session is the strongest signal; failing
     that, the step's own text matching a known suspicious phrase; failing
     that, treated as clean. This is intentionally cruder than the real
-    pipeline (drift_engine + provenance + gate) landing on Day 3 — it
-    exists so P2 can integrate against the real `/guard/*` contract today
+    pipeline (drift_engine + provenance + gate, see `_live_score`) — it
+    exists so a caller can integrate against the real `/guard/*` contract
     without waiting on LLM calls. The actual enforcement decision for this
     score is computed afterward by `gate.decide` (see `_score_and_save_step`),
     same as the real pipeline — this function only produces the score.
@@ -107,7 +124,7 @@ def _mock_score(trace_so_far: Trace, step: TraceStep) -> int:
 
 def _mock_explanation(step: TraceStep, risk_score: int, decision: Decision) -> str:
     """Builds the `explanation` string for a mock-mode detection, mirroring
-    the real pipeline's style in `main._explanation_for` but naming the
+    the real pipeline's style (`gate.explanation_for_step`) but naming the
     deterministic rule that fired instead of real drift/judge scores.
 
     `risk_score` alone identifies which of `_mock_score`'s rules produced
@@ -131,32 +148,83 @@ def _mock_explanation(step: TraceStep, risk_score: int, decision: Decision) -> s
 
 
 def _score_and_save_step(session_id: str, trace_before: Trace, step: TraceStep) -> DetectionOutput:
-    """Shared by `/guard/observe` and `/guard/check`: persists the new
-    step, scores it (mock mode only, for now — see `_require_mock_mode`),
-    and persists the resulting detection.
+    """Shared by `/guard/observe` and `/guard/check`: scores the new step
+    (mock or live, per `_resolve_mode`), then persists both the step and
+    its resulting detection — in that order, and only once scoring has
+    actually succeeded, so a model failure in live mode (`ModelUnavailable`)
+    never leaves an unscored, unpollable step stuck in the session.
+
+    In live mode, scoring reuses `drift_engine.compute_drift_and_risk`
+    against `trace_with_step` (the session so far, plus this one new
+    step) — exactly the same drift+judge pipeline `/analyze-trace` uses.
+    Because `llm.embed_many`/`llm.judge` cache by text content (see
+    `app/llm.py`), re-embedding the session's goal and every earlier
+    step's already-embedded text on each call costs nothing beyond a
+    local cache lookup: the only real model call this makes is the ONE
+    new step's embedding, plus the ONE judge call on its `input_text` —
+    there's no need for a separate per-session embedding cache here.
+    `provenance.get_provenance_flag` runs over the whole session so far
+    (the Day-1 forward-taint logic), same as mock mode.
 
     Parameters:
     - `session_id`: the session this step belongs to.
     - `trace_before`: the session's trace as it was before this step.
     - `step`: the new step (already assigned its `step_id`).
 
-    Returns the saved `DetectionOutput`.
+    Returns the saved `DetectionOutput`. Raises `HTTPException(503)` if
+    live-mode scoring's underlying model call fails even after `llm.py`'s
+    retries (and fallback, if configured).
     """
-    storage.append_step(session_id, trace_before.agent_id, trace_before.original_goal, step)
-
+    mode = _resolve_mode()
     trace_with_step = trace_before.model_copy(update={"steps": [*trace_before.steps, step]})
-    risk_score = _mock_score(trace_before, step)
+    started_at = time.perf_counter()
+
+    try:
+        if mode == "mock":
+            risk_score = _mock_score(trace_before, step)
+            drift_score = 0.0
+        else:
+            try:
+                drift_score, risk_score = compute_drift_and_risk(trace_with_step, step.step_id)
+            except ModelUnavailable as e:
+                raise HTTPException(
+                    status_code=503,
+                    detail=f"Detection model is currently unavailable, scoring session_id={session_id!r} "
+                    f"step {step.step_id} failed after retries: {e}",
+                ) from e
+    finally:
+        elapsed_ms = (time.perf_counter() - started_at) * 1000
+        logger.info(
+            "guard_check_latency_ms=%.1f mode=%s session_id=%s step_id=%s action=%s",
+            elapsed_ms,
+            mode,
+            session_id,
+            step.step_id,
+            step.action,
+        )
+
     provenance_flag = get_provenance_flag(trace_with_step, step.step_id)
     decision = decide(risk_score, provenance_flag, step.action)
+    explanation = (
+        _mock_explanation(step, risk_score, decision)
+        if mode == "mock"
+        else explanation_for_step(step, drift_score, risk_score, provenance_flag)
+    )
 
+    # Persisted only now that scoring has actually succeeded (see
+    # docstring above) — append_step before save_detection_output, same
+    # order /analyze-trace writes in, so a trace_steps row always has a
+    # matching detection_outputs row (get_pending_approvals' join on the
+    # two relies on that).
+    storage.append_step(session_id, trace_before.agent_id, trace_before.original_goal, step)
     output = DetectionOutput(
         trace_id=session_id,
         step_id=step.step_id,
-        drift_score=0.0,  # mock mode computes no real drift signal
+        drift_score=drift_score,
         risk_score=risk_score,
         provenance_flag=provenance_flag,
         classification=classification_for(decision),
-        explanation=_mock_explanation(step, risk_score, decision),
+        explanation=explanation,
         decision=decision,
     )
     storage.save_detection_output(output)
@@ -177,7 +245,7 @@ def start_session(request: GuardSessionRequest) -> GuardSessionResponse:
     Returns a `GuardSessionResponse` with a fresh, unique `session_id`
     (`"session_" + 8 hex chars`).
     """
-    _require_mock_mode()
+    _resolve_mode()
     session_id = f"session_{secrets.token_hex(4)}"
     storage.save_trace(Trace(trace_id=session_id, agent_id=request.agent_id, original_goal=request.original_goal, steps=[]))
     return GuardSessionResponse(session_id=session_id)
@@ -198,7 +266,7 @@ def observe(request: GuardObserveRequest) -> DetectionOutput:
     Returns the resulting `DetectionOutput`. Raises `HTTPException(404)`
     if `session_id` doesn't exist.
     """
-    _require_mock_mode()
+    _resolve_mode()
     trace = _get_session_trace(request.session_id)
 
     step = TraceStep(
@@ -231,9 +299,11 @@ def check(request: GuardCheckRequest) -> GuardCheckResponse:
     (poll `GET /guard/approval/{session_id}/{step_id}`), otherwise
     `"not_required"` — the caller can act on `decision` immediately
     (`allow_logged` → run it, `block` → don't). Raises
-    `HTTPException(404)` if `session_id` doesn't exist.
+    `HTTPException(404)` if `session_id` doesn't exist, or
+    `HTTPException(503)` if live-mode scoring's model call is unavailable
+    (see `_score_and_save_step`).
     """
-    _require_mock_mode()
+    _resolve_mode()
     trace = _get_session_trace(request.session_id)
 
     step = TraceStep(
@@ -256,7 +326,12 @@ def check(request: GuardCheckRequest) -> GuardCheckResponse:
 def get_approval(session_id: str, step_id: int) -> GuardApprovalResponse:
     """API endpoint: `GET /guard/approval/{session_id}/{step_id}`. Lets a
     caller poll for a human operator's decision on a step that
-    `/guard/check` returned `approval_status: "pending"` for.
+    `/guard/check` returned `approval_status: "pending"` for. Any
+    `approval_required` step a live session produces is automatically
+    visible to `GET /pending-approvals` too (it's the same
+    `detection_outputs` table `/analyze-trace` writes to), so a decision
+    made via `POST /approval-decision` shows up here as soon as it's
+    recorded — no separate wiring needed between the two.
 
     Parameters:
     - `session_id`, `step_id` (URL path parameters): which step to check.
@@ -266,7 +341,7 @@ def get_approval(session_id: str, step_id: int) -> GuardApprovalResponse:
     `decided_by`/`decided_at` filled in from `POST /approval-decision`.
     Raises `HTTPException(404)` if this step was never scored at all.
     """
-    _require_mock_mode()
+    _resolve_mode()
     stored_decision = storage.get_detection_decision(session_id, step_id)
     if stored_decision is None:
         raise HTTPException(
@@ -295,7 +370,7 @@ def get_session(session_id: str) -> TraceWithDetections:
     Returns a `TraceWithDetections`. Raises `HTTPException(404)` if no
     session with this id was ever created via `POST /guard/session`.
     """
-    _require_mock_mode()
+    _resolve_mode()
     result = storage.get_trace_with_detections(session_id)
     if result is None:
         raise HTTPException(status_code=404, detail=f"No session found for session_id={session_id!r}.")
@@ -314,7 +389,7 @@ def list_sessions(limit: int = 20) -> list[GuardSessionSummary]:
 
     Returns a list of `GuardSessionSummary`.
     """
-    _require_mock_mode()
+    _resolve_mode()
     return [
         GuardSessionSummary(
             session_id=row["trace_id"],

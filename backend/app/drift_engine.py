@@ -67,6 +67,15 @@ def _describe_action(action: str, action_params: dict[str, Any]) -> str:
     return f"{readable_action} ({params_desc})"
 
 
+# Actions whose actual content lives in `input_text`, not `action_params`
+# -- so drift must embed input_text itself, not a near-empty action
+# description. "tool_output_received" is agent.py's step for a tool's
+# returned content; "observe" is guard.py's fixed action for /guard/observe
+# (content arriving mid-session -- an email, a web page, a handoff -- which
+# always carries empty action_params, see GuardObserveRequest).
+_CONTENT_IN_INPUT_TEXT_ACTIONS = {"tool_output_received", "observe"}
+
+
 def _text_to_embed_for_drift(step: TraceStep) -> str:
     """Decides what text represents this step when measuring how far it has
     drifted from the trace's original goal.
@@ -75,17 +84,17 @@ def _text_to_embed_for_drift(step: TraceStep) -> str:
     - `step`: the trace step being scored.
 
     Returns a string to embed and compare against the original goal. For a
-    "tool_output_received" step, `action_params` is just a generic
-    {"tool": name} — the actual content the agent was exposed to lives in
-    `input_text`, not `action_params`. Embedding the generic label there
-    would make drift_score blind to what was actually read, regardless of
-    how aligned or misaligned that content is with the goal. For every
+    step in `_CONTENT_IN_INPUT_TEXT_ACTIONS`, `action_params` is empty or a
+    generic {"tool": name} — the actual content the agent was exposed to
+    lives in `input_text`, not `action_params`. Embedding the generic label
+    there would make drift_score blind to what was actually read, regardless
+    of how aligned or misaligned that content is with the goal. For every
     other step (a real action the agent took), the action description
     (from `_describe_action`) is still the right signal — that's what
     captures behavioral drift, e.g. goal was "read email" but the action
     taken was "delete files".
     """
-    if step.action == "tool_output_received":
+    if step.action in _CONTENT_IN_INPUT_TEXT_ACTIONS:
         return step.input_text
     return _describe_action(step.action, step.action_params)
 

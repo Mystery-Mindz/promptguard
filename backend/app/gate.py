@@ -4,9 +4,34 @@ from app.config import (
     RISK_APPROVAL_LOW_THRESHOLD,
     RISK_BLOCK_THRESHOLD,
 )
-from app.schemas import Classification, Decision, ProvenanceFlag
+from app.schemas import Classification, Decision, ProvenanceFlag, TraceStep
 
 _DECISION_SEVERITY = {"allow_logged": 0, "approval_required": 1, "block": 2}
+
+
+def explanation_for_step(step: TraceStep, drift_score: float, risk_score: int, provenance_flag: ProvenanceFlag) -> str:
+    """Builds the plain-English `explanation` string shown alongside a
+    step's real (non-mock) detection result, so a human reviewer can see at
+    a glance why a step was scored the way it was. Shared by
+    `/analyze-trace` (`main.py`) and the real `/guard/*` pipeline
+    (`guard.py`) so both report explanations in the same style.
+
+    Parameters:
+    - `step`: the trace step being explained.
+    - `drift_score`, `risk_score`: this step's computed scores.
+    - `provenance_flag`: this step's provenance flag.
+
+    Returns a string like "Step 2 (delete_file): drift_score=0.83,
+    risk_score=87, input is externally sourced" — always includes the
+    scores, and adds a note about provenance when the step is `"tainted"`
+    or `"external"`.
+    """
+    reasons = [f"drift_score={drift_score:.2f}", f"risk_score={risk_score}"]
+    if provenance_flag == "tainted":
+        reasons.append("input traces back to external content via an agent handoff")
+    elif provenance_flag == "external":
+        reasons.append("input is externally sourced")
+    return f"Step {step.step_id} ({step.action}): " + ", ".join(reasons)
 
 
 def classification_for(decision: Decision) -> Classification:

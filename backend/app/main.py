@@ -9,7 +9,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from app import guard, storage
 from app.agent import run_agent
 from app.drift_engine import compute_drift_and_risk
-from app.gate import classification_for, decide
+from app.gate import classification_for, decide, explanation_for_step
 from app.llm import ModelUnavailable
 from app.provenance import get_provenance_flag
 from app.schemas import (
@@ -18,10 +18,8 @@ from app.schemas import (
     DetectionOutput,
     FinalStatus,
     PendingApproval,
-    ProvenanceFlag,
     RunAgentRequest,
     Trace,
-    TraceStep,
     TraceWithDetections,
 )
 
@@ -99,29 +97,6 @@ def run_agent_endpoint(request: RunAgentRequest) -> Trace:
         ) from e
 
 
-def _explanation_for(step: TraceStep, drift_score: float, risk_score: int, provenance_flag: ProvenanceFlag) -> str:
-    """Builds the plain-English `explanation` string shown alongside a
-    step's detection result, so a human reviewer can see at a glance why a
-    step was scored the way it was.
-
-    Parameters:
-    - `step`: the trace step being explained.
-    - `drift_score`, `risk_score`: this step's computed scores.
-    - `provenance_flag`: this step's provenance flag.
-
-    Returns a string like "Step 2 (delete_file): drift_score=0.83,
-    risk_score=87, input is externally sourced" — always includes the
-    scores, and adds a note about provenance when the step is `"tainted"`
-    or `"external"`.
-    """
-    reasons = [f"drift_score={drift_score:.2f}", f"risk_score={risk_score}"]
-    if provenance_flag == "tainted":
-        reasons.append("input traces back to external content via an agent handoff")
-    elif provenance_flag == "external":
-        reasons.append("input is externally sourced")
-    return f"Step {step.step_id} ({step.action}): " + ", ".join(reasons)
-
-
 @app.post("/analyze-trace", response_model=list[DetectionOutput])
 def analyze_trace(trace: Trace) -> list[DetectionOutput]:
     """API endpoint: `POST /analyze-trace`. The core of PromptGuard: runs
@@ -177,7 +152,7 @@ def analyze_trace(trace: Trace) -> list[DetectionOutput]:
             risk_score=risk_score,
             provenance_flag=provenance_flag,
             classification=classification_for(decision),
-            explanation=_explanation_for(step, drift_score, risk_score, provenance_flag),
+            explanation=explanation_for_step(step, drift_score, risk_score, provenance_flag),
             decision=decision,
         )
         storage.save_detection_output(output)
@@ -215,8 +190,12 @@ def pending_approvals_endpoint() -> list[PendingApproval]:
     decision.
 
     Takes no parameters. Returns a list of `PendingApproval` (oldest
-    first): every step flagged `approval_required` by `/analyze-trace`
-    that hasn't been approved or denied yet.
+    first): every step flagged `approval_required` by `/analyze-trace` or a
+    live `/guard/check` that hasn't been approved or denied yet. Carries
+    `action`, `action_params`, `input_text`, `drift_score`, and
+    `classification` (added for Prompt 3.1, additive to the existing
+    fields) so the Operator Approval Console can show what is actually
+    being approved, not just its score.
     """
     return [
         PendingApproval(
@@ -226,6 +205,11 @@ def pending_approvals_endpoint() -> list[PendingApproval]:
             provenance_flag=row["provenance_flag"],
             explanation=row["explanation"],
             timestamp=row["created_at"],
+            action=row["action"],
+            action_params=row["action_params"],
+            input_text=row["input_text"],
+            drift_score=row["drift_score"],
+            classification=row["classification"],
         )
         for row in storage.get_pending_approvals()
     ]
